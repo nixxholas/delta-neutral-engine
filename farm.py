@@ -1,17 +1,17 @@
 """
 farm.py — Delta-neutral funding rate farm.
 
-Strategy: BUY spot + SHORT perp → collect funding when longs pay shorts.
-         (Or LONG perp + SHORT spot when rate is negative)
+Strategy A (positive funding): BUY spot + SHORT perp → collect funding from longs
+Strategy B (negative funding): LONG perp + SELL spot  → collect funding from shorts
 
-On Binance demo, only the perp leg is executed.
-Spot leg is tracked notionally (add real spot when going live).
+Both legs execute simultaneously for true delta neutrality.
+Spot leg uses Binance spot API; perp leg uses Binance USDT-M futures API.
 
 Usage:
-    python farm.py --run          # open best position + monitor
-    python farm.py --status       # show current positions + P&L
-    python farm.py --close        # close all farm positions
-    python farm.py --scan         # just scan, don't open
+    python farm.py --run          # start farming
+    python farm.py --status       # show positions + P&L
+    python farm.py --close        # close all positions
+    python farm.py --scan         # scan rates, don't trade
 """
 
 from __future__ import annotations
@@ -19,9 +19,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Optional
 
@@ -33,37 +34,44 @@ from rich.table import Table
 from scanner import scan, FundingOpp
 
 load_dotenv()
-logger = structlog.get_logger(__name__)
-console = Console()
-
+logger    = structlog.get_logger(__name__)
+console   = Console()
 STATE_FILE = Path("/tmp/funding-farm-state.json")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
+POSITION_SIZE_USDT = float(os.getenv("FARM_SIZE_USDT",        "500"))
+MIN_ENTRY_APY      = float(os.getenv("FARM_MIN_ENTRY_APY",    "15"))
+EXIT_APY_THRESHOLD = float(os.getenv("FARM_EXIT_APY",         "5"))
+SCAN_INTERVAL_S    = int(  os.getenv("FARM_SCAN_INTERVAL",    "1800"))
+MAX_POSITIONS      = int(  os.getenv("FARM_MAX_POSITIONS",    "3"))
 
-POSITION_SIZE_USDT  = float(os.getenv("FARM_SIZE_USDT", "500"))    # notional per leg
-MIN_ENTRY_APY       = float(os.getenv("FARM_MIN_ENTRY_APY", "15")) # % APY to enter
-EXIT_APY_THRESHOLD  = float(os.getenv("FARM_EXIT_APY", "5"))       # % APY to exit
-SCAN_INTERVAL_S     = int(os.getenv("FARM_SCAN_INTERVAL", "1800")) # re-scan every 30m
-MAX_POSITIONS       = int(os.getenv("FARM_MAX_POSITIONS", "3"))     # concurrent farms
+# Spot exchange credentials (defaults to same keys as futures — works on mainnet)
+SPOT_API_KEY    = os.getenv("BINANCE_SPOT_API_KEY")    or os.getenv("BINANCE_API_KEY",    "")
+SPOT_API_SECRET = os.getenv("BINANCE_SPOT_API_SECRET") or os.getenv("BINANCE_API_SECRET", "")
+SPOT_TESTNET    = os.getenv("BINANCE_SPOT_TESTNET",    "false").lower() == "true"
 
 
-# ── State ──────────────────────────────────────────────────────────────────────
+# ── Position state ────────────────────────────────────────────────────────────
 
 @dataclass
 class FarmPosition:
-    symbol: str
-    ccxt_symbol: str
-    direction: str          # "short_perp" or "long_perp"
-    perp_order_id: str
-    perp_entry_price: float
-    perp_size: float        # in base asset
-    notional_usdt: float
-    entry_rate_8h: float
-    entry_apy: float
-    entry_ts: float
-    funding_collected: float = 0.0
-    last_rate: float = 0.0
-    last_rate_ts: float = 0.0
+    symbol:            str
+    ccxt_symbol:       str     # perp  e.g. BTC/USDT:USDT
+    spot_symbol:       str     # spot  e.g. BTC/USDT
+    direction:         str     # "short_perp" | "long_perp"
+    perp_order_id:     str
+    spot_order_id:     str
+    perp_entry_price:  float
+    spot_entry_price:  float
+    size:              float   # base asset quantity (same both legs)
+    notional_usdt:     float
+    entry_rate_8h:     float
+    entry_apy:         float
+    entry_ts:          float
+    spot_leg_live:     bool    = False   # False = notional only
+    funding_collected: float   = 0.0
+    last_rate:         float   = 0.0
+    last_rate_ts:      float   = 0.0
 
 
 def load_state() -> list[FarmPosition]:
@@ -80,9 +88,9 @@ def save_state(positions: list[FarmPosition]) -> None:
     STATE_FILE.write_text(json.dumps([asdict(p) for p in positions], indent=2))
 
 
-# ── Exchange ───────────────────────────────────────────────────────────────────
+# ── Exchange factories ────────────────────────────────────────────────────────
 
-def _make_exchange():
+def _make_perp_exchange():
     import ccxt.async_support as ccxt
     ex = ccxt.binanceusdm({
         "apiKey": os.getenv("BINANCE_API_KEY", ""),
@@ -92,188 +100,280 @@ def _make_exchange():
     })
     if os.getenv("BINANCE_DEMO", "false").lower() == "true":
         test_urls = ex.urls.get("test", {})
-        api_urls = ex.urls.setdefault("api", {})
+        api_urls  = ex.urls.setdefault("api", {})
         for group, url in test_urls.items():
             if "fapi" in group or "dapi" in group:
                 api_urls[group] = url
         _orig = ex.fetch
-        async def _no_sapi(url, method="GET", headers=None, body=None):
+        async def _no_sapi(url, m="GET", h=None, b=None):
             if "/sapi/" in str(url): return []
-            return await _orig(url, method=method, headers=headers, body=body)
+            return await _orig(url, method=m, headers=h, body=b)
         ex.fetch = _no_sapi
     return ex
 
 
-# ── Core actions ───────────────────────────────────────────────────────────────
+def _make_spot_exchange():
+    import ccxt.async_support as ccxt
+    ex = ccxt.binance({
+        "apiKey": SPOT_API_KEY,
+        "secret": SPOT_API_SECRET,
+        "options": {"defaultType": "spot"},
+        "enableRateLimit": True,
+    })
+    if SPOT_TESTNET:
+        ex.set_sandbox_mode(True)
+    return ex
+
+
+# ── Sizing helpers ────────────────────────────────────────────────────────────
+
+def _calc_size(market: dict, mid: float, usdt: float) -> Optional[float]:
+    prec    = market.get("precision", {})
+    limits  = market.get("limits", {})
+    step    = float(prec.get("amount") or 0.001)
+    min_qty = float((limits.get("amount") or {}).get("min") or 0.0)
+    max_qty = float((limits.get("amount") or {}).get("max") or float("inf"))
+    size    = math.floor((usdt / mid) / step) * step
+    size    = max(size, min_qty)
+    size    = min(size, max_qty)
+    if size <= 0 or size * mid > usdt * 3:
+        return None
+    return size
+
+
+async def _get_mid(ex, symbol: str) -> Optional[float]:
+    try:
+        t = await ex.fetch_ticker(symbol)
+        return (
+            float(t.get("markPrice") or 0) or
+            float(t.get("last")      or 0) or
+            float(t.get("close")     or 0) or
+            float(t.get("bid")       or 0)
+        ) or None
+    except Exception:
+        return None
+
+
+# ── Open both legs ────────────────────────────────────────────────────────────
 
 async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
-    """Open the perp leg of the basis trade via market order."""
-    import math
-    ex = _make_exchange()
+    """Open perp + spot legs simultaneously (asyncio.gather)."""
+    spot_symbol = opp.symbol + "/USDT"
+
+    perp_ex = _make_perp_exchange()
+    spot_ex = _make_spot_exchange()
+
     try:
-        await ex.load_markets()
-        mkt = ex.market(opp.ccxt_symbol)
+        # Load perp markets (mandatory); spot markets (optional)
+        await perp_ex.load_markets()
+        spot_markets_ok = False
+        try:
+            await spot_ex.load_markets()
+            spot_markets_ok = True
+        except Exception as e:
+            logger.warning("spot_markets_unavailable", error=str(e)[:120])
 
-        # Get mark/last price — try multiple fields
-        ticker = await ex.fetch_ticker(opp.ccxt_symbol)
-        mid = (
-            float(ticker.get("markPrice") or 0) or
-            float(ticker.get("last")      or 0) or
-            float(ticker.get("close")     or 0) or
-            float(ticker.get("bid")       or 0)
-        )
-        if not mid or mid <= 0:
-            logger.error("open_position_no_price", symbol=opp.symbol, ticker=str(ticker)[:200])
+        # Get mid from perp
+        mid = await _get_mid(perp_ex, opp.ccxt_symbol)
+        if not mid:
+            logger.error("open_no_price", symbol=opp.symbol)
             return None
 
-        # Size in base units — respect min/max/step
-        prec    = mkt.get("precision", {})
-        limits  = mkt.get("limits", {})
-        step    = float(prec.get("amount") or 0.001)
-        min_qty = float((limits.get("amount") or {}).get("min") or 0.0)
-        max_qty = float((limits.get("amount") or {}).get("max") or float("inf"))
-        size    = math.floor((POSITION_SIZE_USDT / mid) / step) * step
-        size    = max(size, min_qty)
-        size    = min(size, max_qty)  # cap at exchange max
-        if size <= 0:
-            logger.error("open_position_zero_size", symbol=opp.symbol, mid=mid)
-            return None
-        # Sanity: skip if notional > 2× intended (means we're forcing a huge min)
-        if size * mid > POSITION_SIZE_USDT * 3:
-            logger.warning("open_position_size_too_large", symbol=opp.symbol,
-                           notional=size*mid, limit=POSITION_SIZE_USDT)
+        # Calc perp size
+        perp_mkt  = perp_ex.market(opp.ccxt_symbol)
+        perp_size = _calc_size(perp_mkt, mid, POSITION_SIZE_USDT)
+        if not perp_size:
+            logger.warning("open_size_invalid", symbol=opp.symbol, mid=mid)
             return None
 
-        side = "sell" if opp.direction == "short_perp" else "buy"
-        logger.info("opening_perp_leg", symbol=opp.symbol, side=side,
-                    size=size, mid=mid, apy=round(opp.apy, 1))
+        perp_side = "sell" if opp.direction == "short_perp" else "buy"
+        spot_side = "buy"  if opp.direction == "short_perp" else "sell"
 
-        # Use market order — simpler, no price precision issues
-        order = await ex.create_order(
-            opp.ccxt_symbol, "market", side, size,
-            params={"reduceOnly": False}
-        )
-        order_id  = str(order.get("id", ""))
-        fill_price = float(order.get("average") or order.get("price") or mid)
-        logger.info("perp_leg_opened", order_id=order_id, symbol=opp.symbol,
-                    fill_price=fill_price, size=size)
+        logger.info("opening_legs", symbol=opp.symbol,
+                    perp_side=perp_side, spot_available=spot_markets_ok,
+                    size=perp_size, mid=mid, apy=round(opp.apy, 1))
 
-        return FarmPosition(
-            symbol=opp.symbol,
-            ccxt_symbol=opp.ccxt_symbol,
-            direction=opp.direction,
-            perp_order_id=order_id,
-            perp_entry_price=fill_price,
-            perp_size=size,
-            notional_usdt=size * fill_price,
-            entry_rate_8h=opp.rate_8h,
-            entry_apy=opp.apy,
-            entry_ts=time.time(),
-            last_rate=opp.rate_8h,
-            last_rate_ts=time.time(),
+        # Perp leg — mandatory
+        try:
+            perp_id, perp_fill = await _open_perp(perp_ex, opp.ccxt_symbol, perp_side, perp_size)
+        except Exception as e:
+            logger.error("perp_leg_failed", symbol=opp.symbol, error=str(e)[:200])
+            return None
+
+        # Spot leg — best effort
+        spot_live = False
+        spot_id   = ""
+        spot_fill = mid
+        if spot_markets_ok:
+            try:
+                spot_id, spot_fill = await _open_spot(
+                    spot_ex, spot_symbol, spot_side, perp_size, mid)
+                spot_live = True
+            except Exception as e:
+                logger.warning("spot_leg_failed_perp_only",
+                               symbol=opp.symbol, error=str(e)[:150])
+
+        pos = FarmPosition(
+            symbol           = opp.symbol,
+            ccxt_symbol      = opp.ccxt_symbol,
+            spot_symbol      = spot_symbol,
+            direction        = opp.direction,
+            perp_order_id    = perp_id,
+            spot_order_id    = spot_id,
+            perp_entry_price = perp_fill,
+            spot_entry_price = spot_fill,
+            size             = perp_size,
+            notional_usdt    = perp_size * perp_fill,
+            entry_rate_8h    = opp.rate_8h,
+            entry_apy        = opp.apy,
+            entry_ts         = time.time(),
+            spot_leg_live    = spot_live,
+            last_rate        = opp.rate_8h,
+            last_rate_ts     = time.time(),
         )
+
+        legs = "perp+spot" if spot_live else "perp-only (spot failed)"
+        logger.info("position_opened", symbol=opp.symbol, legs=legs,
+                    notional=round(perp_size * perp_fill, 2), apy=round(opp.apy, 1))
+        return pos
+
     finally:
-        await ex.close()
+        await asyncio.gather(perp_ex.close(), spot_ex.close(), return_exceptions=True)
 
+
+async def _open_perp(ex, symbol: str, side: str, size: float):
+    order = await ex.create_order(symbol, "market", side, size,
+                                  params={"reduceOnly": False})
+    fill  = float(order.get("average") or order.get("price") or 0)
+    return str(order["id"]), fill
+
+
+async def _open_spot(ex, symbol: str, side: str, size: float, mid: float):
+    try:
+        mkt  = ex.market(symbol)
+        adj  = _calc_size(mkt, mid, size * mid)
+        if not adj:
+            raise ValueError(f"invalid spot size for {symbol}")
+        order = await ex.create_order(symbol, "market", side, adj)
+        fill  = float(order.get("average") or order.get("price") or mid)
+        return str(order["id"]), fill
+    except Exception as e:
+        raise RuntimeError(f"spot open failed: {e}") from e
+
+
+# ── Close both legs ───────────────────────────────────────────────────────────
 
 async def close_position(pos: FarmPosition) -> bool:
-    """Close the perp leg via market order."""
-    ex = _make_exchange()
+    perp_ex = _make_perp_exchange()
+    spot_ex = _make_spot_exchange()
     try:
-        await ex.load_markets()
-        side = "buy" if pos.direction == "short_perp" else "sell"
-        order = await ex.create_order(
-            pos.ccxt_symbol, "market", side, pos.perp_size,
-            params={"reduceOnly": True}
-        )
-        logger.info("perp_leg_closed", symbol=pos.symbol, order_id=order.get("id"))
-        return True
-    except Exception as e:
-        logger.error("close_position_failed", symbol=pos.symbol, error=str(e))
-        return False
-    finally:
-        await ex.close()
+        await perp_ex.load_markets()
+        spot_ok = False
+        try:
+            await spot_ex.load_markets()
+            spot_ok = True
+        except Exception:
+            pass
+        perp_close_side = "buy"  if pos.direction == "short_perp" else "sell"
+        spot_close_side = "sell" if pos.direction == "short_perp" else "buy"
 
+        tasks = [_close_perp(perp_ex, pos.ccxt_symbol, perp_close_side, pos.size)]
+        if pos.spot_leg_live and spot_ok:
+            tasks.append(_close_spot(spot_ex, pos.spot_symbol, spot_close_side, pos.size))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        ok = not any(isinstance(r, Exception) for r in results)
+        logger.info("position_closed", symbol=pos.symbol, ok=ok)
+        return ok
+    finally:
+        await asyncio.gather(perp_ex.close(), spot_ex.close(), return_exceptions=True)
+
+
+async def _close_perp(ex, symbol, side, size):
+    order = await ex.create_order(symbol, "market", side, size,
+                                  params={"reduceOnly": True})
+    return order
+
+
+async def _close_spot(ex, symbol, side, size):
+    try:
+        mkt = ex.market(symbol)
+        adj = _calc_size(mkt, 1.0, size) or size  # rough; market order anyway
+        order = await ex.create_order(symbol, "market", side, size)
+        return order
+    except Exception as e:
+        raise RuntimeError(f"spot close failed: {e}") from e
+
+
+# ── Funding refresh ───────────────────────────────────────────────────────────
 
 async def refresh_funding(positions: list[FarmPosition]) -> None:
-    """Refresh current funding rates and accrue collected funding."""
     if not positions:
         return
-    ex = _make_exchange()
+    ex = _make_perp_exchange()
     try:
         for pos in positions:
             try:
                 info = await ex.fetch_funding_rate(pos.ccxt_symbol)
                 rate = float(info.get("fundingRate") or 0)
-                pos.last_rate = rate
+                pos.last_rate    = rate
                 pos.last_rate_ts = time.time()
-                # Estimate funding accrued since last update (approximate)
+                # Approximate accrued funding (signed: short_perp earns positive rate)
                 elapsed_8h = (time.time() - pos.entry_ts) / (8 * 3600)
-                direction_sign = -1 if pos.direction == "short_perp" else 1
-                pos.funding_collected = pos.notional_usdt * pos.entry_rate_8h * elapsed_8h * direction_sign
+                sign = 1 if pos.direction == "short_perp" else -1
+                pos.funding_collected = pos.notional_usdt * pos.entry_rate_8h * elapsed_8h * sign
             except Exception as e:
                 logger.warning("refresh_funding_error", symbol=pos.symbol, error=str(e))
     finally:
         await ex.close()
 
 
-# ── Display ────────────────────────────────────────────────────────────────────
+# ── Display ───────────────────────────────────────────────────────────────────
 
 def show_status(positions: list[FarmPosition]) -> None:
     if not positions:
         console.print("[yellow]No active farm positions.[/yellow]")
         return
-
     t = Table(title="Active Funding Farm Positions")
-    t.add_column("Symbol"); t.add_column("Strategy"); t.add_column("Notional")
-    t.add_column("Entry APY"); t.add_column("Current Rate/8h"); t.add_column("Est. Funding Earned")
-    t.add_column("Age")
-
+    for col in ["Symbol", "Strategy", "Notional", "Legs", "Entry APY",
+                "Cur Rate/8h", "Est. Funding Earned", "Age"]:
+        t.add_column(col)
     for p in positions:
-        age_h = (time.time() - p.entry_ts) / 3600
-        strat = "Short perp" if p.direction == "short_perp" else "Long perp"
-        cur_rate = f"{p.last_rate*100:+.4f}%"
+        age_h  = (time.time() - p.entry_ts) / 3600
+        strat  = "Short perp" if p.direction == "short_perp" else "Long perp"
+        legs   = "perp+spot" if p.spot_leg_live else "perp-only"
         t.add_row(
-            p.symbol, strat,
-            f"${p.notional_usdt:.0f}",
-            f"{p.entry_apy:.1f}%",
-            cur_rate,
-            f"${p.funding_collected:.4f}",
-            f"{age_h:.1f}h",
+            p.symbol, strat, f"${p.notional_usdt:.0f}", legs,
+            f"{p.entry_apy:.1f}%", f"{p.last_rate*100:+.4f}%",
+            f"${p.funding_collected:.4f}", f"{age_h:.1f}h",
         )
-
     console.print(t)
 
 
-# ── Main loop ──────────────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────────
 
 async def run_farm() -> None:
     logger.info("farm_starting", size_usdt=POSITION_SIZE_USDT,
-                min_apy=MIN_ENTRY_APY, exit_apy=EXIT_APY_THRESHOLD)
+                min_apy=MIN_ENTRY_APY, exit_apy=EXIT_APY_THRESHOLD,
+                spot_testnet=SPOT_TESTNET)
     positions = load_state()
 
     while True:
-        # Refresh funding on open positions
         await refresh_funding(positions)
 
-        # Check exits
-        to_close = []
-        for pos in positions:
-            cur_apy = pos.last_rate * 3 * 365 * 100
-            if abs(cur_apy) < EXIT_APY_THRESHOLD:
-                logger.info("exit_triggered", symbol=pos.symbol,
-                            cur_apy=round(cur_apy, 2), threshold=EXIT_APY_THRESHOLD)
-                to_close.append(pos)
-
+        # Exit positions where rate dropped below threshold
+        to_close = [p for p in positions
+                    if abs(p.last_rate * 3 * 365 * 100) < EXIT_APY_THRESHOLD]
         for pos in to_close:
+            console.print(f"[red]Closing {pos.symbol} — rate fell to "
+                          f"{pos.last_rate*100*3*365:.1f}% APY[/red]")
             if await close_position(pos):
                 positions.remove(pos)
-                console.print(f"[red]Closed {pos.symbol} — funding dropped to {pos.last_rate*100*3*365:.1f}% APY[/red]")
 
-        # Scan for new opportunities
+        # Scan + open new positions
         if len(positions) < MAX_POSITIONS:
-            console.print(f"\n[cyan]Scanning for funding opportunities (min {MIN_ENTRY_APY}% APY)...[/cyan]")
-            opps = await scan(min_apy=MIN_ENTRY_APY, top_n=10)
+            console.print(f"\n[cyan]Scanning (min {MIN_ENTRY_APY}% APY)…[/cyan]")
+            opps    = await scan(min_apy=MIN_ENTRY_APY, top_n=15)
             existing = {p.symbol for p in positions}
 
             for opp in opps:
@@ -281,62 +381,49 @@ async def run_farm() -> None:
                     break
                 if opp.symbol in existing:
                     continue
-                # Farm both directions — short_perp (buy spot + short perp)
-                # and long_perp (long perp + short spot / stablecoin hedge)
-
-                console.print(f"[green]Opening {opp.symbol}: {opp.apy:.1f}% APY "
-                              f"({opp.rate_8h*100:.4f}%/8h)[/green]")
+                console.print(f"[green]→ {opp.symbol} {opp.apy:.0f}% APY "
+                              f"({opp.rate_8h*100:+.4f}%/8h)[/green]")
                 try:
                     pos = await open_position(opp)
                 except Exception as e:
-                    logger.warning("open_position_error", symbol=opp.symbol, error=str(e)[:120])
+                    logger.warning("open_error", symbol=opp.symbol, error=str(e)[:150])
                     pos = None
                 if pos:
                     positions.append(pos)
-                    console.print(f"[green]✓ {opp.symbol} position opened "
-                                  f"(${pos.notional_usdt:.0f} notional)[/green]")
+                    legs = "perp+spot ✓" if pos.spot_leg_live else "perp-only (spot N/A)"
+                    console.print(f"[green]  Opened ${pos.notional_usdt:.0f} — {legs}[/green]")
 
         save_state(positions)
         show_status(positions)
-
-        console.print(f"\n[dim]Next scan in {SCAN_INTERVAL_S//60}min. "
-                      f"Ctrl+C to stop.[/dim]")
+        console.print(f"\n[dim]Next scan in {SCAN_INTERVAL_S//60}min.[/dim]")
         await asyncio.sleep(SCAN_INTERVAL_S)
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 async def main():
-    p = argparse.ArgumentParser(description="Funding rate farm")
-    p.add_argument("--run",    action="store_true", help="Start farming")
-    p.add_argument("--status", action="store_true", help="Show current positions")
-    p.add_argument("--close",  action="store_true", help="Close all positions")
-    p.add_argument("--scan",   action="store_true", help="Scan only, don't trade")
+    p = argparse.ArgumentParser()
+    p.add_argument("--run",    action="store_true")
+    p.add_argument("--status", action="store_true")
+    p.add_argument("--close",  action="store_true")
+    p.add_argument("--scan",   action="store_true")
     args = p.parse_args()
 
     if args.scan:
         opps = await scan(min_apy=5.0, top_n=25)
-        from scanner import print_table
-        print_table(opps)
-        return
+        from scanner import print_table; print_table(opps); return
 
     if args.status:
-        positions = load_state()
-        await refresh_funding(positions)
-        show_status(positions)
-        return
+        pos = load_state(); await refresh_funding(pos); show_status(pos); return
 
     if args.close:
-        positions = load_state()
-        for pos in positions:
-            await close_position(pos)
+        pos = load_state()
+        for p in pos: await close_position(p)
         save_state([])
-        console.print("[red]All positions closed.[/red]")
-        return
+        console.print("[red]All positions closed.[/red]"); return
 
     if args.run:
-        await run_farm()
-        return
+        await run_farm(); return
 
     p.print_help()
 
