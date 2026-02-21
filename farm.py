@@ -273,14 +273,28 @@ async def _open_perp(ex, symbol: str, side: str, size: float):
     return str(order["id"]), fill
 
 
-async def _open_spot(ex, symbol: str, side: str, size: float, mid: float):
+async def _open_spot(ex, symbol: str, side: str, perp_size: float, perp_mid: float):
+    """
+    Open spot leg. Uses the actual spot price for sizing (not perp mark price)
+    so notional matches in USD terms — critical for delta neutrality.
+    """
     try:
-        mkt  = ex.market(symbol)
-        adj  = _calc_size(mkt, mid, size * mid)
+        mkt = ex.market(symbol)
+        # Get spot price independently
+        spot_ticker = await ex.fetch_ticker(symbol)
+        spot_mid = (
+            float(spot_ticker.get("last")  or 0) or
+            float(spot_ticker.get("close") or 0) or
+            float(spot_ticker.get("bid")   or 0) or
+            perp_mid  # last resort fallback
+        )
+        target_usdt = perp_size * perp_mid   # dollar notional to match
+        adj = _calc_size(mkt, spot_mid, target_usdt)
         if not adj:
-            raise ValueError(f"invalid spot size for {symbol}")
+            raise ValueError(f"invalid spot size for {symbol} "
+                             f"(spot_mid={spot_mid}, target=${target_usdt:.2f})")
         order = await ex.create_order(symbol, "market", side, adj)
-        fill  = float(order.get("average") or order.get("price") or mid)
+        fill  = float(order.get("average") or order.get("price") or spot_mid)
         return str(order["id"]), fill
     except Exception as e:
         raise RuntimeError(f"spot open failed: {e}") from e
