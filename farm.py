@@ -189,29 +189,44 @@ async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
         perp_side = "sell" if opp.direction == "short_perp" else "buy"
         spot_side = "buy"  if opp.direction == "short_perp" else "sell"
 
-        logger.info("opening_legs", symbol=opp.symbol,
-                    perp_side=perp_side, spot_available=spot_markets_ok,
+        # ── Enforce delta neutrality: spot MUST be available before any perp opens ──
+        if not spot_markets_ok:
+            logger.warning("spot_unavailable_skipping", symbol=opp.symbol,
+                           note="No spot API — will not open naked perp. "
+                                "Set BINANCE_SPOT_API_KEY in .env to enable.")
+            return None
+
+        logger.info("opening_both_legs", symbol=opp.symbol,
+                    perp_side=perp_side, spot_side=spot_side,
                     size=perp_size, mid=mid, apy=round(opp.apy, 1))
 
-        # Perp leg — mandatory
+        # Open perp first, then spot. If spot fails, roll back perp.
         try:
             perp_id, perp_fill = await _open_perp(perp_ex, opp.ccxt_symbol, perp_side, perp_size)
         except Exception as e:
             logger.error("perp_leg_failed", symbol=opp.symbol, error=str(e)[:200])
             return None
 
-        # Spot leg — best effort
-        spot_live = False
         spot_id   = ""
         spot_fill = mid
-        if spot_markets_ok:
+        spot_live = False
+        try:
+            spot_id, spot_fill = await _open_spot(
+                spot_ex, spot_symbol, spot_side, perp_size, mid)
+            spot_live = True
+        except Exception as e:
+            logger.error("spot_leg_failed_rolling_back_perp",
+                         symbol=opp.symbol, error=str(e)[:200])
             try:
-                spot_id, spot_fill = await _open_spot(
-                    spot_ex, spot_symbol, spot_side, perp_size, mid)
-                spot_live = True
-            except Exception as e:
-                logger.warning("spot_leg_failed_perp_only",
-                               symbol=opp.symbol, error=str(e)[:150])
+                rollback_side = "buy" if perp_side == "sell" else "sell"
+                await perp_ex.create_order(
+                    opp.ccxt_symbol, "market", rollback_side, perp_size,
+                    params={"reduceOnly": True})
+                logger.info("perp_rolled_back", symbol=opp.symbol)
+            except Exception as rb_err:
+                logger.error("rollback_failed_manual_action_required",
+                             symbol=opp.symbol, error=str(rb_err)[:150])
+            return None
 
         pos = FarmPosition(
             symbol           = opp.symbol,
