@@ -227,15 +227,7 @@ async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
         except Exception as e:
             logger.error("spot_leg_failed_rolling_back_perp",
                          symbol=opp.symbol, error=str(e)[:200])
-            try:
-                rollback_side = "buy" if perp_side == "sell" else "sell"
-                await perp_ex.create_order(
-                    opp.ccxt_symbol, "market", rollback_side, perp_size,
-                    params={"reduceOnly": True})
-                logger.info("perp_rolled_back", symbol=opp.symbol)
-            except Exception as rb_err:
-                logger.error("rollback_failed_manual_action_required",
-                             symbol=opp.symbol, error=str(rb_err)[:150])
+            await _rollback_perp(perp_ex, opp.ccxt_symbol, perp_side, perp_size, mid)
             return None
 
         pos = FarmPosition(
@@ -264,6 +256,55 @@ async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
 
     finally:
         await asyncio.gather(perp_ex.close(), spot_ex.close(), return_exceptions=True)
+
+
+async def _rollback_perp(ex, symbol: str, opened_side: str, size: float, ref_mid: float) -> None:
+    """
+    Reverse a perp leg after spot fails. Tries multiple strategies to handle
+    testnet PERCENT_PRICE filter and max-quantity limits.
+    """
+    rollback_side = "buy" if opened_side == "sell" else "sell"
+    mkt     = ex.market(symbol)
+    max_qty = float((mkt.get("limits") or {}).get("amount", {}).get("max") or size)
+    step    = float((mkt.get("precision") or {}).get("amount") or 1.0)
+
+    # Strategy 1: simple market reduceOnly
+    try:
+        await ex.create_order(symbol, "market", rollback_side, size,
+                              params={"reduceOnly": True})
+        logger.info("perp_rolled_back", symbol=symbol, method="market")
+        return
+    except Exception as e:
+        logger.warning("rollback_market_failed", symbol=symbol, error=str(e)[:120])
+
+    # Strategy 2: limit order at mark price ± small ticks, chunked if needed
+    try:
+        ticker = await ex.fetch_ticker(symbol)
+        mark   = float(ticker.get("last") or ticker.get("close") or ref_mid)
+        remaining = size
+        chunk_num = 0
+        while remaining > step * 0.5:
+            chunk      = math.floor(min(remaining, max_qty) / step) * step
+            chunk_num += 1
+            placed     = False
+            for mult in [0.998, 0.995, 0.990, 0.980, 0.970]:
+                lp = mark * mult if rollback_side == "buy" else mark / mult
+                lp = round(lp, 8)
+                try:
+                    await ex.create_order(symbol, "limit", rollback_side, chunk, lp,
+                                          params={"reduceOnly": True, "timeInForce": "GTC"})
+                    logger.info("perp_rolled_back", symbol=symbol,
+                                method=f"limit@{lp:.7f}", chunk=chunk_num)
+                    placed = True
+                    break
+                except Exception:
+                    continue
+            if not placed:
+                raise RuntimeError(f"all limit attempts failed for chunk {chunk_num}")
+            remaining -= chunk
+    except Exception as rb_err:
+        logger.error("rollback_failed_MANUAL_ACTION_REQUIRED",
+                     symbol=symbol, size=size, error=str(rb_err)[:200])
 
 
 async def _open_perp(ex, symbol: str, side: str, size: float):
@@ -412,8 +453,21 @@ async def run_farm() -> None:
         # Scan + open new positions
         if len(positions) < MAX_POSITIONS:
             console.print(f"\n[cyan]Scanning (min {MIN_ENTRY_APY}% APY)…[/cyan]")
-            opps    = await scan(min_apy=MIN_ENTRY_APY, top_n=15)
+            opps    = await scan(min_apy=MIN_ENTRY_APY, top_n=30)
             existing = {p.symbol for p in positions}
+
+            # Pre-filter: only try tokens that actually exist on spot exchange
+            # (avoids open-perp → spot-fail → rollback cycle for entire tokens)
+            spot_ex_check = _make_spot_exchange()
+            try:
+                await spot_ex_check.load_markets()
+                spot_symbols = set(spot_ex_check.markets.keys())
+                opps = [o for o in opps if f"{o.symbol}/USDT" in spot_symbols]
+                console.print(f"[dim]  {len(opps)} opps with spot market[/dim]")
+            except Exception as e:
+                logger.warning("spot_prefilter_failed", error=str(e)[:100])
+            finally:
+                await spot_ex_check.close()
 
             for opp in opps:
                 if len(positions) >= MAX_POSITIONS:
