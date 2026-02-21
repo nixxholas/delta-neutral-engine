@@ -107,73 +107,83 @@ def _make_exchange():
 # ── Core actions ───────────────────────────────────────────────────────────────
 
 async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
-    """Open the perp leg of the basis trade."""
+    """Open the perp leg of the basis trade via market order."""
+    import math
     ex = _make_exchange()
     try:
         await ex.load_markets()
         mkt = ex.market(opp.ccxt_symbol)
-        mid_resp = await ex.fetch_ticker(opp.ccxt_symbol)
-        mid = float(mid_resp.get("last") or mid_resp.get("markPrice") or 0)
-        if not mid:
-            logger.error("open_position_no_price", symbol=opp.symbol)
+
+        # Get mark/last price — try multiple fields
+        ticker = await ex.fetch_ticker(opp.ccxt_symbol)
+        mid = (
+            float(ticker.get("markPrice") or 0) or
+            float(ticker.get("last")      or 0) or
+            float(ticker.get("close")     or 0) or
+            float(ticker.get("bid")       or 0)
+        )
+        if not mid or mid <= 0:
+            logger.error("open_position_no_price", symbol=opp.symbol, ticker=str(ticker)[:200])
             return None
 
-        size = POSITION_SIZE_USDT / mid
-        # Respect min notional and step size
-        limits = mkt.get("limits", {})
-        prec   = mkt.get("precision", {})
-        step   = prec.get("amount") or 0.001
-        min_qty = (limits.get("amount") or {}).get("min") or 0.0
-        import math
-        size = math.floor(size / step) * step
-        size = max(size, min_qty)
+        # Size in base units — respect min/max/step
+        prec    = mkt.get("precision", {})
+        limits  = mkt.get("limits", {})
+        step    = float(prec.get("amount") or 0.001)
+        min_qty = float((limits.get("amount") or {}).get("min") or 0.0)
+        max_qty = float((limits.get("amount") or {}).get("max") or float("inf"))
+        size    = math.floor((POSITION_SIZE_USDT / mid) / step) * step
+        size    = max(size, min_qty)
+        size    = min(size, max_qty)  # cap at exchange max
+        if size <= 0:
+            logger.error("open_position_zero_size", symbol=opp.symbol, mid=mid)
+            return None
+        # Sanity: skip if notional > 2× intended (means we're forcing a huge min)
+        if size * mid > POSITION_SIZE_USDT * 3:
+            logger.warning("open_position_size_too_large", symbol=opp.symbol,
+                           notional=size*mid, limit=POSITION_SIZE_USDT)
+            return None
 
-        # Direction: if short_perp → sell; if long_perp → buy
         side = "sell" if opp.direction == "short_perp" else "buy"
-        slippage = 0.001
-        price = round(mid * (1 - slippage) if side == "sell" else mid * (1 + slippage), 2)
-
         logger.info("opening_perp_leg", symbol=opp.symbol, side=side,
-                    size=size, price=price, apy=round(opp.apy, 1))
+                    size=size, mid=mid, apy=round(opp.apy, 1))
 
-        order = await ex.create_limit_order(
-            opp.ccxt_symbol, side, size, price,
+        # Use market order — simpler, no price precision issues
+        order = await ex.create_order(
+            opp.ccxt_symbol, "market", side, size,
             params={"reduceOnly": False}
         )
-        order_id = str(order.get("id", ""))
-        logger.info("perp_leg_opened", order_id=order_id, symbol=opp.symbol)
+        order_id  = str(order.get("id", ""))
+        fill_price = float(order.get("average") or order.get("price") or mid)
+        logger.info("perp_leg_opened", order_id=order_id, symbol=opp.symbol,
+                    fill_price=fill_price, size=size)
 
-        pos = FarmPosition(
+        return FarmPosition(
             symbol=opp.symbol,
             ccxt_symbol=opp.ccxt_symbol,
             direction=opp.direction,
             perp_order_id=order_id,
-            perp_entry_price=price,
+            perp_entry_price=fill_price,
             perp_size=size,
-            notional_usdt=size * price,
+            notional_usdt=size * fill_price,
             entry_rate_8h=opp.rate_8h,
             entry_apy=opp.apy,
             entry_ts=time.time(),
             last_rate=opp.rate_8h,
             last_rate_ts=time.time(),
         )
-        return pos
     finally:
         await ex.close()
 
 
 async def close_position(pos: FarmPosition) -> bool:
-    """Close the perp leg."""
+    """Close the perp leg via market order."""
     ex = _make_exchange()
     try:
         await ex.load_markets()
         side = "buy" if pos.direction == "short_perp" else "sell"
-        mid_resp = await ex.fetch_ticker(pos.ccxt_symbol)
-        mid = float(mid_resp.get("last") or 0)
-        slippage = 0.001
-        price = round(mid * (1 + slippage) if side == "buy" else mid * (1 - slippage), 2)
-        order = await ex.create_limit_order(
-            pos.ccxt_symbol, side, pos.perp_size, price,
+        order = await ex.create_order(
+            pos.ccxt_symbol, "market", side, pos.perp_size,
             params={"reduceOnly": True}
         )
         logger.info("perp_leg_closed", symbol=pos.symbol, order_id=order.get("id"))
@@ -271,13 +281,16 @@ async def run_farm() -> None:
                     break
                 if opp.symbol in existing:
                     continue
-                if opp.direction != "short_perp":
-                    # Skip long_perp for now (requires spot short/borrowing)
-                    continue
+                # Farm both directions — short_perp (buy spot + short perp)
+                # and long_perp (long perp + short spot / stablecoin hedge)
 
                 console.print(f"[green]Opening {opp.symbol}: {opp.apy:.1f}% APY "
                               f"({opp.rate_8h*100:.4f}%/8h)[/green]")
-                pos = await open_position(opp)
+                try:
+                    pos = await open_position(opp)
+                except Exception as e:
+                    logger.warning("open_position_error", symbol=opp.symbol, error=str(e)[:120])
+                    pos = None
                 if pos:
                     positions.append(pos)
                     console.print(f"[green]✓ {opp.symbol} position opened "
