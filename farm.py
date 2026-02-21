@@ -114,12 +114,22 @@ def _make_perp_exchange():
 
 def _make_spot_exchange():
     import ccxt.async_support as ccxt
-    ex = ccxt.binance({
+
+    key_path = os.getenv("BINANCE_SPOT_PRIVATE_KEY_PATH", "")
+    config: dict = {
         "apiKey": SPOT_API_KEY,
-        "secret": SPOT_API_SECRET,
         "options": {"defaultType": "spot"},
         "enableRateLimit": True,
-    })
+    }
+
+    if key_path and os.path.exists(key_path):
+        # Ed25519 signing: CCXT detects PEM by checking if secret contains "PRIVATE KEY"
+        with open(key_path, "r") as f:
+            config["secret"] = f.read()
+    else:
+        config["secret"] = SPOT_API_SECRET
+
+    ex = ccxt.binance(config)
     if SPOT_TESTNET:
         ex.set_sandbox_mode(True)
     return ex
