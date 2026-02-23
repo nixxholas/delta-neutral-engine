@@ -990,11 +990,21 @@ def show_status(positions: list[FarmPosition]) -> None:
     total_borrow     = sum(p.borrow_accrued for p in positions)
     total_fees_paid  = sum(p.entry_fee_usdt for p in positions)
     total_net_pnl    = total_funding - total_borrow - total_fees_paid
+
+    # Portfolio metrics use LIVE rates (not entry rates) — shows actual current exposure
+    def _live_net_apy(p: FarmPosition) -> float:
+        earn_sign = 1 if p.direction == "short_perp" else -1
+        live_apy  = p.last_rate * earn_sign * 3 * 365 * 100
+        return live_apy - (BORROW_RATE_APY * 100)
+
     weighted_net_apy = (
-        sum(p.notional_usdt * _net_apy(p.entry_apy) for p in positions) / total_notional
+        sum(p.notional_usdt * _live_net_apy(p) for p in positions) / total_notional
         if total_notional > 0 else 0.0
     )
-    daily_net_est    = sum(_daily_net_usdt(p.notional_usdt, p.entry_apy) for p in positions)
+    daily_net_est = sum(
+        p.notional_usdt * _live_net_apy(p) / 100.0 / 365.0
+        for p in positions
+    )
 
     # ── Per-position table ─────────────────────────────────────────────────────
     # Next Binance funding settlement (every 8h at 00:00/08:00/16:00 UTC)
@@ -1005,44 +1015,51 @@ def show_status(positions: list[FarmPosition]) -> None:
     for col, justify, style in [
         ("Sym",         "left",  "bold"),
         ("Notional",    "right", ""),
-        ("Gross%",      "right", ""),
-        ("Net%",        "right", ""),
-        ("$/day",       "right", "green"),
-        ("BE(RT)",      "right", ""),      # break-even using round-trip fees
-        ("Realized$",   "right", "green"), # actual settled by exchange
-        ("Accruing$",   "right", "cyan"),  # current period estimate
+        ("Entry APY",   "right", "dim"),   # APY when opened — for reference only
+        ("Live APY",    "right", ""),      # current rate annualised — what we're ACTUALLY earning now
+        ("Net APY",     "right", ""),      # live APY - borrow cost
+        ("$/day",       "right", "green"), # based on live rate
+        ("BE(RT)",      "right", ""),
+        ("Realized$",   "right", "green"),
+        ("Accruing$",   "right", "cyan"),
         ("Borrow$",     "right", "dim"),
         ("Net P&L",     "right", ""),
-        ("Rate/8h",     "right", ""),
         ("Age",         "right", "dim"),
     ]:
         t.add_column(col, justify=justify, style=style)
 
     for p in positions:
         age_h     = (time.time() - p.entry_ts) / 3600
-        net_apy   = _net_apy(p.entry_apy)
-        daily_net = _daily_net_usdt(p.notional_usdt, p.entry_apy)
-        be_days   = _breakeven_days(p.entry_apy)   # now uses RT_FEE_PCT
-        net_pnl   = p.funding_collected - p.borrow_accrued - p.entry_fee_usdt
 
-        be_str        = f"{be_days:.1f}d" if be_days < 999 else "∞"
-        be_color      = "green" if be_days < 7 else ("yellow" if be_days < MAX_BREAKEVEN_DAYS else "red")
-        net_apy_color = "green" if net_apy > 0 else "red"
-        pnl_color     = "green" if net_pnl >= 0 else "red"
-        age_str       = f"{age_h/24:.1f}d" if age_h >= 24 else f"{age_h:.1f}h"
+        # Live earning APY: the rate we're ACTUALLY on right now
+        # long_perp earns when rate < 0; effective = -rate * annualisation
+        earn_sign  = 1 if p.direction == "short_perp" else -1
+        live_apy   = p.last_rate * earn_sign * 3 * 365 * 100   # signed: positive = earning
+        live_net   = live_apy - (BORROW_RATE_APY * 100)
+        daily_net  = p.notional_usdt * live_net / 100.0 / 365.0
+
+        be_days    = _breakeven_days(live_apy)   # based on LIVE rate, not entry
+        net_pnl    = p.funding_collected - p.borrow_accrued - p.entry_fee_usdt
+
+        be_str         = f"{be_days:.1f}d" if be_days < 999 else "∞"
+        be_color       = "green" if be_days < 7 else ("yellow" if be_days < MAX_BREAKEVEN_DAYS else "red")
+        live_apy_color = "green" if live_apy > 5 else ("yellow" if live_apy > 0 else "red")
+        live_net_color = "green" if live_net > 0 else "red"
+        pnl_color      = "green" if net_pnl >= 0 else "red"
+        age_str        = f"{age_h/24:.1f}d" if age_h >= 24 else f"{age_h:.1f}h"
 
         t.add_row(
             p.symbol,
             f"${p.notional_usdt:.0f}",
             f"{p.entry_apy:.1f}%",
-            f"[{net_apy_color}]{net_apy:.1f}%[/{net_apy_color}]",
+            f"[{live_apy_color}]{live_apy:.1f}%[/{live_apy_color}]",
+            f"[{live_net_color}]{live_net:.1f}%[/{live_net_color}]",
             f"${daily_net:.4f}",
             f"[{be_color}]{be_str}[/{be_color}]",
             f"${p.funding_realized:.4f}",
             f"~${p.funding_accruing:.4f}",
             f"${p.borrow_accrued:.4f}",
             f"[{pnl_color}]${net_pnl:.4f}[/{pnl_color}]",
-            f"{p.last_rate*100:+.4f}%",
             age_str,
         )
     _con.print(t)
