@@ -486,91 +486,134 @@ def show_status(positions: list[FarmPosition]) -> None:
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 async def run_farm() -> None:
+    from monitor import FarmMonitor, RateUpdate
+
     logger.info("farm_starting", size_usdt=POSITION_SIZE_USDT,
                 min_apy=MIN_ENTRY_APY, exit_apy=EXIT_APY_THRESHOLD,
                 spot_testnet=SPOT_TESTNET)
     positions = load_state()
 
-    while True:
-        await refresh_funding(positions)
+    # WS exit signals arrive here (non-blocking)
+    exit_queue: asyncio.Queue = asyncio.Queue()
 
-        # Exit positions where rate dropped below threshold
-        to_close = [p for p in positions
-                    if abs(p.last_rate * 3 * 365 * 100) < EXIT_APY_THRESHOLD]
-        for pos in to_close:
-            console.print(f"[red]Closing {pos.symbol} — rate fell to "
-                          f"{pos.last_rate*100*3*365:.1f}% APY[/red]")
-            if await close_position(pos):
-                positions.remove(pos)
+    def _on_rate_update(u: RateUpdate) -> None:
+        for pos in positions:
+            if pos.ccxt_symbol == u.ccxt_symbol:
+                pos.last_rate    = u.funding_rate
+                pos.last_rate_ts = u.ts
 
-        # Scan + open new positions
-        if len(positions) < MAX_POSITIONS:
-            console.print(f"\n[cyan]Scanning (min {MIN_ENTRY_APY}% APY)…[/cyan]")
-            opps    = await scan(min_apy=MIN_ENTRY_APY, top_n=30)
-            existing = {p.symbol for p in positions}
+    def _on_exit_signal(u: RateUpdate) -> None:
+        logger.warning("ws_exit_signal", symbol=u.symbol,
+                       apy=round(u.apy, 1), threshold=EXIT_APY_THRESHOLD)
+        exit_queue.put_nowait(u.ccxt_symbol)
 
-            # Pre-filter: only try tokens available on spot AND where we can
-            # actually execute the required spot leg (have USDT for buys,
-            # or hold the token for sells)
-            spot_ex_check = _make_spot_exchange()
-            spot_symbols: set = set()
-            spot_balances: dict = {}
-            try:
-                await spot_ex_check.load_markets()
-                spot_symbols = set(spot_ex_check.markets.keys())
-                bal = await spot_ex_check.fetch_balance()
-                spot_balances = {k: float(v.get("free", 0))
-                                 for k, v in bal.items()
-                                 if isinstance(v, dict)}
-            except Exception as e:
-                logger.warning("spot_prefilter_failed", error=str(e)[:100])
-            finally:
-                await spot_ex_check.close()
+    # Start WS monitor — single connection, all symbols at 1s
+    monitor = FarmMonitor(
+        exit_apy_threshold = EXIT_APY_THRESHOLD,
+        on_rate_update     = _on_rate_update,
+        on_exit_signal     = _on_exit_signal,
+    )
+    for pos in positions:
+        monitor.watch(pos.ccxt_symbol, pos.symbol, pos.direction)
+    await monitor.start()
 
-            spot_usdt = spot_balances.get("USDT", 0.0)
+    last_scan_ts = 0.0   # force scan on first loop iteration
 
-            def _can_execute(opp: FundingOpp) -> bool:
-                spot_sym = f"{opp.symbol}/USDT"
-                if spot_sym not in spot_symbols:
-                    return False
-                if opp.direction == "short_perp":
-                    # Need USDT to buy spot
-                    return spot_usdt >= POSITION_SIZE_USDT * 0.9
-                else:
-                    # long_perp: need to short spot → must hold enough of the token
-                    held  = spot_balances.get(opp.symbol, 0.0)
-                    price = opp.mid_price or 1.0
-                    held_usdt = held * price
-                    return held_usdt >= POSITION_SIZE_USDT * 0.9
-
-            opps = [o for o in opps if _can_execute(o)]
-            console.print(f"[dim]  {len(opps)} opps pass spot pre-filter "
-                          f"(USDT=${spot_usdt:.0f})[/dim]")
-
-            for opp in opps:
-                if len(positions) >= MAX_POSITIONS:
-                    break
-                if opp.symbol in existing:
-                    continue
-                console.print(f"[green]→ {opp.symbol} {opp.apy:.0f}% APY "
-                              f"({opp.rate_8h*100:+.4f}%/8h)[/green]")
+    try:
+        while True:
+            # ── 1. Process WS exit signals immediately ─────────────────────
+            pending_exits: set = set()
+            while not exit_queue.empty():
                 try:
-                    pos = await open_position(opp)
-                except Exception as e:
-                    logger.warning("open_error", symbol=opp.symbol, error=str(e)[:150])
-                    pos = None
-                # Throttle between every attempt (success or fail) to avoid
-                # bursting orders and hitting -1000 Global Order rate limit
-                await asyncio.sleep(5.0)
-                if pos:
-                    positions.append(pos)
-                    legs = "perp+spot ✓" if pos.spot_leg_live else "perp-only (spot N/A)"
-                    console.print(f"[green]  Opened ${pos.notional_usdt:.0f} — {legs}[/green]")
+                    pending_exits.add(exit_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
 
-        save_state(positions)
-        show_status(positions)
-        console.print(f"\n[dim]Next scan in {SCAN_INTERVAL_S//60}min.[/dim]")
-        await asyncio.sleep(SCAN_INTERVAL_S)
+            to_close = [p for p in positions
+                        if p.ccxt_symbol in pending_exits
+                        or abs(p.last_rate * 3 * 365 * 100) < EXIT_APY_THRESHOLD]
+            for pos in to_close:
+                eff = (pos.last_rate if pos.direction == "short_perp"
+                       else -pos.last_rate) * 3 * 365 * 100
+                console.print(f"[red]Closing {pos.symbol} — "
+                              f"rate {eff:.1f}% APY < threshold[/red]")
+                if await close_position(pos):
+                    monitor.unwatch(pos.ccxt_symbol)
+                    positions.remove(pos)
+
+            # ── 2. Scan for new positions (rate-limited) ───────────────────
+            now = time.time()
+            if len(positions) < MAX_POSITIONS and (now - last_scan_ts) >= SCAN_INTERVAL_S:
+                console.print(f"\n[cyan]Scanning (min {MIN_ENTRY_APY}% APY)…[/cyan]")
+                opps     = await scan(min_apy=MIN_ENTRY_APY, top_n=30)
+                existing = {p.symbol for p in positions}
+
+                # Pre-filter: spot market exists + sufficient balance for leg
+                spot_ex_check = _make_spot_exchange()
+                spot_symbols: set  = set()
+                spot_balances: dict = {}
+                try:
+                    await spot_ex_check.load_markets()
+                    spot_symbols = set(spot_ex_check.markets.keys())
+                    bal = await spot_ex_check.fetch_balance()
+                    spot_balances = {k: float(v.get("free", 0))
+                                     for k, v in bal.items()
+                                     if isinstance(v, dict)}
+                except Exception as e:
+                    logger.warning("spot_prefilter_failed", error=str(e)[:100])
+                finally:
+                    await spot_ex_check.close()
+
+                spot_usdt = spot_balances.get("USDT", 0.0)
+
+                def _can_execute(opp: FundingOpp) -> bool:
+                    if f"{opp.symbol}/USDT" not in spot_symbols:
+                        return False
+                    if opp.direction == "short_perp":
+                        return spot_usdt >= POSITION_SIZE_USDT * 0.9
+                    else:
+                        held      = spot_balances.get(opp.symbol, 0.0)
+                        held_usdt = held * (opp.mid_price or 1.0)
+                        return held_usdt >= POSITION_SIZE_USDT * 0.9
+
+                opps = [o for o in opps if _can_execute(o)]
+                console.print(f"[dim]  {len(opps)} opps pass spot pre-filter "
+                              f"(USDT=${spot_usdt:.0f})[/dim]")
+
+                for opp in opps:
+                    if len(positions) >= MAX_POSITIONS:
+                        break
+                    if opp.symbol in existing:
+                        continue
+                    console.print(f"[green]→ {opp.symbol} {opp.apy:.0f}% APY "
+                                  f"({opp.rate_8h*100:+.4f}%/8h)[/green]")
+                    try:
+                        pos = await open_position(opp)
+                    except Exception as e:
+                        logger.warning("open_error", symbol=opp.symbol, error=str(e)[:150])
+                        pos = None
+                    await asyncio.sleep(5.0)   # throttle between attempts
+                    if pos:
+                        positions.append(pos)
+                        monitor.watch(pos.ccxt_symbol, pos.symbol, pos.direction)
+                        existing.add(pos.symbol)
+                        legs = "perp+spot ✓" if pos.spot_leg_live else "perp-only"
+                        console.print(f"[green]  Opened ${pos.notional_usdt:.0f} "
+                                      f"— {legs}[/green]")
+
+                last_scan_ts = time.time()
+                save_state(positions)
+                show_status(positions)
+                next_min = SCAN_INTERVAL_S // 60
+                console.print(f"\n[dim]Next scan in {next_min}min "
+                              f"| WS monitor: {len(monitor._watched)} symbols[/dim]")
+
+            # ── 3. Short sleep — WS drives real-time exits, this paces scan ─
+            await asyncio.sleep(30)
+
+    finally:
+        await monitor.stop()
+        logger.info("farm_stopped")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
