@@ -577,9 +577,9 @@ async def run_farm() -> None:
                         held      = spot_balances.get(opp.symbol, 0.0)
                         price     = opp.mid_price or 1.0
                         held_usdt = held * price
-                        # Require 110% headroom — price may move between pre-filter
-                        # and order execution; avoids "insufficient balance" failures
-                        return held_usdt >= POSITION_SIZE_USDT * 1.10
+                        # 100% threshold: if borderline, spot leg fails and rolls
+                        # back cleanly — better than over-filtering good opps
+                        return held_usdt >= POSITION_SIZE_USDT
 
                 opps = [o for o in opps if _can_execute(o)]
                 console.print(f"[dim]  {len(opps)} opps pass spot pre-filter "
