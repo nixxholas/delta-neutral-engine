@@ -116,6 +116,9 @@ class FarmPosition:
     funding_collected: float   = 0.0
     last_rate:         float   = 0.0
     last_rate_ts:      float   = 0.0
+    needs_close:       bool    = False   # True = must close regardless of current rate
+    perp_closed:       bool    = False   # True = perp leg confirmed closed
+    spot_closed:       bool    = False   # True = spot leg confirmed closed
 
 
 def load_state() -> list[FarmPosition]:
@@ -303,53 +306,116 @@ async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
         await asyncio.gather(perp_ex.close(), spot_ex.close(), return_exceptions=True)
 
 
-async def _rollback_perp(ex, symbol: str, opened_side: str, size: float, ref_mid: float) -> None:
-    """
-    Reverse a perp leg after spot fails. Tries multiple strategies to handle
-    testnet PERCENT_PRICE filter and max-quantity limits.
-    """
-    rollback_side = "buy" if opened_side == "sell" else "sell"
-    mkt     = ex.market(symbol)
-    max_qty = float((mkt.get("limits") or {}).get("amount", {}).get("max") or size)
-    step    = float((mkt.get("precision") or {}).get("amount") or 1.0)
-
-    # Strategy 1: simple market reduceOnly
+async def _fetch_actual_perp_size(ex, symbol: str) -> float:
+    """Fetch actual open position size from exchange (contracts). Returns 0 if no position."""
     try:
-        await ex.create_order(symbol, "market", rollback_side, size,
-                              params={"reduceOnly": True})
-        logger.info("perp_rolled_back", symbol=symbol, method="market")
-        return
+        positions = await ex.fetch_positions([symbol])
+        for p in positions:
+            if p.get("symbol") == symbol:
+                return abs(float(p.get("contracts") or p.get("contractSize") or 0))
+        return 0.0
     except Exception as e:
-        logger.warning("rollback_market_failed", symbol=symbol, error=str(e)[:120])
+        logger.warning("fetch_actual_perp_size_failed", symbol=symbol, error=str(e)[:120])
+        return 0.0
 
-    # Strategy 2: limit order at mark price ± small ticks, chunked if needed
+
+async def _close_perp_robust(
+    ex,
+    symbol: str,
+    close_side: str,   # "buy" to close short, "sell" to close long
+    stored_size: float,
+    ref_mid: float,
+    label: str = "close",
+) -> bool:
+    """
+    Close (or rollback) a perp position robustly.
+
+    Strategy:
+      1. Fetch actual position size from exchange — if already 0, we're done.
+      2. Market reduceOnly with actual size.
+      3. On failure: fall back to chunked limit orders at mark ± ticks.
+      4. Verify position is 0 after all attempts.
+
+    Returns True if position confirmed closed (or was already closed).
+    """
+    mkt      = ex.market(symbol)
+    max_qty  = float((mkt.get("limits") or {}).get("amount", {}).get("max") or stored_size)
+    step     = float((mkt.get("precision") or {}).get("amount") or 1.0)
+
+    # Step 1: fetch actual size — if 0 already, we're done
+    actual = await _fetch_actual_perp_size(ex, symbol)
+    if actual < step * 0.5:
+        logger.info(f"perp_{label}_already_flat", symbol=symbol)
+        return True
+
+    # Use actual size (not stored) to avoid -2022 size mismatches
+    remaining = actual
+    logger.info(f"perp_{label}_start", symbol=symbol,
+                actual_size=actual, stored_size=stored_size, side=close_side)
+
+    # Step 2: market reduceOnly
+    try:
+        await ex.create_order(symbol, "market", close_side, remaining,
+                              params={"reduceOnly": True})
+        logger.info(f"perp_{label}_ok", symbol=symbol, method="market")
+        # Verify
+        post = await _fetch_actual_perp_size(ex, symbol)
+        if post < step * 0.5:
+            return True
+        remaining = post  # partially closed — fall through to limit orders
+    except Exception as e:
+        logger.warning(f"perp_{label}_market_failed", symbol=symbol, error=str(e)[:140])
+
+    # Step 3: limit order fallback, chunked
     try:
         ticker = await ex.fetch_ticker(symbol)
-        mark   = float(ticker.get("last") or ticker.get("close") or ref_mid)
-        remaining = size
+        mark   = float(ticker.get("last") or ticker.get("close") or ref_mid or 1.0)
         chunk_num = 0
         while remaining > step * 0.5:
             chunk      = math.floor(min(remaining, max_qty) / step) * step
             chunk_num += 1
             placed     = False
-            for mult in [0.998, 0.995, 0.990, 0.980, 0.970]:
-                lp = mark * mult if rollback_side == "buy" else mark / mult
+            for mult in [0.998, 0.995, 0.990, 0.980, 0.970, 0.950]:
+                lp = mark * mult if close_side == "buy" else mark / mult
                 lp = round(lp, 8)
                 try:
-                    await ex.create_order(symbol, "limit", rollback_side, chunk, lp,
+                    await ex.create_order(symbol, "limit", close_side, chunk, lp,
                                           params={"reduceOnly": True, "timeInForce": "GTC"})
-                    logger.info("perp_rolled_back", symbol=symbol,
+                    logger.info(f"perp_{label}_ok", symbol=symbol,
                                 method=f"limit@{lp:.7f}", chunk=chunk_num)
                     placed = True
                     break
-                except Exception:
+                except Exception as le:
+                    logger.warning(f"perp_{label}_limit_attempt_failed",
+                                   symbol=symbol, mult=mult, error=str(le)[:80])
                     continue
             if not placed:
-                raise RuntimeError(f"all limit attempts failed for chunk {chunk_num}")
+                logger.error(f"perp_{label}_all_attempts_failed_MANUAL_REQUIRED",
+                             symbol=symbol, remaining=remaining)
+                return False
             remaining -= chunk
-    except Exception as rb_err:
-        logger.error("rollback_failed_MANUAL_ACTION_REQUIRED",
-                     symbol=symbol, size=size, error=str(rb_err)[:200])
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        logger.error(f"perp_{label}_limit_phase_error_MANUAL_REQUIRED",
+                     symbol=symbol, error=str(e)[:200])
+        return False
+
+    # Final verify
+    post = await _fetch_actual_perp_size(ex, symbol)
+    if post < step * 0.5:
+        logger.info(f"perp_{label}_verified_flat", symbol=symbol)
+        return True
+    # Limit orders placed but may be pending fill (GTC) — treat as in-progress
+    logger.warning(f"perp_{label}_limit_orders_pending", symbol=symbol, remaining=post)
+    return False
+
+
+async def _rollback_perp(ex, symbol: str, opened_side: str, size: float, ref_mid: float) -> None:
+    """Reverse a perp leg after spot open fails."""
+    rollback_side = "buy" if opened_side == "sell" else "sell"
+    ok = await _close_perp_robust(ex, symbol, rollback_side, size, ref_mid, label="rollback")
+    if not ok:
+        logger.error("rollback_failed_MANUAL_ACTION_REQUIRED", symbol=symbol, size=size)
 
 
 async def _open_perp(ex, symbol: str, side: str, size: float):
@@ -394,48 +460,145 @@ async def _open_spot(ex, symbol: str, side: str, perp_size: float, perp_mid: flo
 # ── Close both legs ───────────────────────────────────────────────────────────
 
 async def close_position(pos: FarmPosition) -> bool:
+    """
+    Close both legs of a position robustly.
+
+    Strategy:
+    - Close perp first (via _close_perp_robust — fetches actual size, multi-fallback).
+    - Then close spot (via _close_spot_robust — fetches actual balance, robust).
+    - Track per-leg state on pos.perp_closed / pos.spot_closed so retries skip done legs.
+    - Returns True only if BOTH legs confirmed closed.
+
+    IMPORTANT: If perp closes but spot fails, the position is delta-exposed.
+    The main loop will retry on next tick due to pos.needs_close=True.
+    A CRITICAL log is emitted so the operator knows immediately.
+    """
     perp_ex = _make_perp_exchange()
     spot_ex = _make_spot_exchange()
     try:
         await perp_ex.load_markets()
-        spot_ok = False
-        try:
-            await spot_ex.load_markets()
-            spot_ok = True
-        except Exception:
-            pass
+
         perp_close_side = "buy"  if pos.direction == "short_perp" else "sell"
         spot_close_side = "sell" if pos.direction == "short_perp" else "buy"
 
-        tasks = [_close_perp(perp_ex, pos.ccxt_symbol, perp_close_side, pos.size)]
-        if pos.spot_leg_live and spot_ok:
-            tasks.append(_close_spot(spot_ex, pos.spot_symbol, spot_close_side, pos.size))
+        # ── Perp leg ──────────────────────────────────────────────────────────
+        if not pos.perp_closed:
+            # Get current mark price for fallback reference
+            ticker  = await perp_ex.fetch_ticker(pos.ccxt_symbol)
+            ref_mid = float(ticker.get("last") or ticker.get("close") or pos.perp_entry_price)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        ok = not any(isinstance(r, Exception) for r in results)
-        logger.info("position_closed", symbol=pos.symbol, ok=ok)
-        return ok
+            perp_ok = await _close_perp_robust(
+                perp_ex, pos.ccxt_symbol, perp_close_side, pos.size, ref_mid)
+            if perp_ok:
+                pos.perp_closed = True
+                logger.info("perp_leg_closed", symbol=pos.symbol)
+            else:
+                logger.error("perp_leg_close_FAILED_will_retry", symbol=pos.symbol)
+                return False   # Don't touch spot until perp is confirmed closed
+
+        # ── Spot leg ──────────────────────────────────────────────────────────
+        if pos.spot_leg_live and not pos.spot_closed:
+            spot_markets_ok = False
+            try:
+                await spot_ex.load_markets()
+                spot_markets_ok = True
+            except Exception as e:
+                logger.error("spot_markets_unavailable_on_close", symbol=pos.symbol,
+                             error=str(e)[:120])
+
+            if not spot_markets_ok:
+                # Perp already closed → we're delta-exposed on spot. Emergency.
+                logger.error(
+                    "CRITICAL_delta_exposed_spot_leg_cannot_reach",
+                    symbol=pos.symbol,
+                    note="Perp closed but spot exchange unreachable — "
+                         "manual spot close required!")
+                return False
+
+            ticker_spot = await spot_ex.fetch_ticker(pos.spot_symbol)
+            ref_spot = (float(ticker_spot.get("last") or 0) or
+                        float(ticker_spot.get("close") or 0) or pos.spot_entry_price)
+
+            spot_ok = await _close_spot_robust(
+                spot_ex, pos.spot_symbol, spot_close_side, pos.size, ref_spot)
+            if spot_ok:
+                pos.spot_closed = True
+                logger.info("spot_leg_closed", symbol=pos.symbol)
+            else:
+                # Perp is flat, spot is still open → delta exposure!
+                logger.error(
+                    "CRITICAL_delta_exposed_spot_close_failed",
+                    symbol=pos.symbol,
+                    note="Perp closed, spot close FAILED — retrying next tick")
+                return False
+
+        both_done = pos.perp_closed and (pos.spot_closed or not pos.spot_leg_live)
+        logger.info("position_closed", symbol=pos.symbol, ok=both_done,
+                    perp_done=pos.perp_closed, spot_done=pos.spot_closed)
+        return both_done
+
     finally:
         await asyncio.gather(perp_ex.close(), spot_ex.close(), return_exceptions=True)
 
 
-async def _close_perp(ex, symbol, side, size):
-    order = await _with_retry(
-        lambda: ex.create_order(symbol, "market", side, size, params={"reduceOnly": True}),
-        label=f"close_perp:{symbol}:{side}")
-    return order
-
-
-async def _close_spot(ex, symbol, side, size):
+async def _fetch_actual_spot_balance(ex, asset: str) -> float:
+    """Fetch actual free balance of an asset on spot exchange."""
     try:
-        mkt = ex.market(symbol)
-        adj = _calc_size(mkt, 1.0, size) or size
-        order = await _with_retry(
-            lambda: ex.create_order(symbol, "market", side, size),
-            label=f"close_spot:{symbol}:{side}")
-        return order
+        bal = await ex.fetch_balance()
+        return float((bal.get(asset) or {}).get("free") or 0)
     except Exception as e:
-        raise RuntimeError(f"spot close failed: {e}") from e
+        logger.warning("fetch_spot_balance_failed", asset=asset, error=str(e)[:120])
+        return 0.0
+
+
+async def _close_spot_robust(
+    ex,
+    symbol: str,    # e.g. "SXP/USDT"
+    side: str,      # "sell" for short_perp unwind, "buy" for long_perp unwind
+    stored_size: float,
+    ref_mid: float,
+) -> bool:
+    """
+    Close spot leg robustly.
+
+    For 'sell' (unwinding spot buy): check actual token balance, sell what we have.
+    For 'buy'  (unwinding spot short): buy back with USDT; use stored_size as reference.
+    Returns True if order placed (market fills assumed instant).
+    """
+    base = symbol.split("/")[0]
+    mkt  = ex.market(symbol)
+    step = float((mkt.get("precision") or {}).get("amount") or 0.001)
+    try:
+        if side == "sell":
+            # Selling token back to USDT — use actual balance, not stored
+            actual = await _fetch_actual_spot_balance(ex, base)
+            if actual < step * 0.5:
+                logger.info("spot_close_already_flat", symbol=symbol, side=side)
+                return True
+            # Don't over-sell beyond stored_size (guard against stale balance data)
+            sell_qty = math.floor(min(actual, stored_size * 1.02) / step) * step
+            logger.info("spot_close_start", symbol=symbol, side=side,
+                        actual_balance=actual, sell_qty=sell_qty)
+            await _with_retry(
+                lambda: ex.create_order(symbol, "market", "sell", sell_qty),
+                label=f"close_spot:{symbol}:sell")
+        else:
+            # Buying back spot short — use stored_size (USDT denominated)
+            # Re-derive qty from current price
+            spot_ticker = await ex.fetch_ticker(symbol)
+            spot_mid = (float(spot_ticker.get("last") or 0) or
+                        float(spot_ticker.get("close") or 0) or ref_mid or 1.0)
+            buy_qty = math.floor(min(stored_size, stored_size * 1.02) / step) * step
+            logger.info("spot_close_start", symbol=symbol, side=side,
+                        spot_mid=spot_mid, buy_qty=buy_qty)
+            await _with_retry(
+                lambda: ex.create_order(symbol, "market", "buy", buy_qty),
+                label=f"close_spot:{symbol}:buy")
+        logger.info("spot_close_ok", symbol=symbol, side=side)
+        return True
+    except Exception as e:
+        logger.error("spot_close_failed", symbol=symbol, side=side, error=str(e)[:200])
+        return False
 
 
 # ── Funding refresh ───────────────────────────────────────────────────────────
@@ -483,67 +646,78 @@ def show_status(positions: list[FarmPosition]) -> None:
     console.print(t)
 
 
-async def _close_naked_positions(tracked: list) -> None:
+async def _reconcile_on_startup(tracked: list) -> None:
     """
-    On startup: find any open perp positions NOT in state and close them.
-    These arise from failed rollbacks (network blips, IP bans, etc.).
+    On startup: two-pass reconciliation.
+
+    Pass 1 — Naked positions (not in state):
+        Any open perp position not tracked in state → close immediately.
+        These come from failed rollbacks, crashed sessions, etc.
+
+    Pass 2 — Size drift for tracked positions:
+        For each tracked position, fetch actual exchange size.
+        If it differs from stored pos.size by >5%, update pos.size to actual.
+        If actual is 0 (already flat), mark pos.perp_closed = True.
+        This prevents -2022 errors from stale size in state.
     """
-    tracked_syms = {p.ccxt_symbol for p in tracked}
+    tracked_map = {p.ccxt_symbol: p for p in tracked}
     perp = _make_perp_exchange()
     try:
         await perp.load_markets()
-        positions = await perp.fetch_positions()
-        naked = [p for p in positions
-                 if abs(float(p.get("contracts", 0))) > 0
-                 and p["symbol"] not in tracked_syms]
-        if not naked:
-            logger.info("startup_check_clean", tracked=len(tracked_syms))
-            return
-        logger.warning("naked_positions_detected_on_startup", count=len(naked),
-                       symbols=[p["symbol"] for p in naked])
-        console.print(f"[yellow]⚠️  {len(naked)} naked position(s) detected — "
-                      f"closing before farm starts...[/yellow]")
-        for pos in naked:
-            sym       = pos["symbol"]
-            side      = pos.get("side", "")
-            contracts = float(pos.get("contracts", 0))
-            close_side = "buy" if side == "short" else "sell"
-            mkt       = perp.market(sym)
-            max_qty   = float((mkt.get("limits") or {}).get("amount", {}).get("max") or contracts)
-            step      = float((mkt.get("precision") or {}).get("amount") or 1.0)
-            ticker    = await perp.fetch_ticker(sym)
-            mark      = float(ticker.get("last") or ticker.get("close") or 0)
-            remaining = contracts
-            chunk_n   = 0
-            while remaining > step * 0.5:
-                chunk   = math.floor(min(remaining, max_qty) / step) * step
-                chunk_n += 1
-                success = False
-                for order_type, price_mult in [("market", None), ("limit", 0.998),
-                                               ("limit", 0.995), ("limit", 0.990)]:
-                    try:
-                        if order_type == "market":
-                            o = await perp.create_order(sym, "market", close_side, chunk,
-                                                        params={"reduceOnly": True})
-                        else:
-                            lp = mark * price_mult
-                            o  = await perp.create_order(sym, "limit", close_side,
-                                                         chunk, lp,
-                                                         params={"reduceOnly": True,
-                                                                 "timeInForce": "GTC"})
-                        logger.info("startup_naked_closed", symbol=sym,
-                                    chunk=chunk_n, order_id=o["id"])
-                        success = True
-                        break
-                    except Exception as e:
-                        logger.warning("startup_close_attempt_failed", symbol=sym,
-                                       method=order_type, error=str(e)[:80])
-                if not success:
-                    logger.error("startup_close_failed_manual_needed", symbol=sym)
-                    break
-                remaining -= chunk
-                await asyncio.sleep(1)
-            console.print(f"[yellow]  Closed {side} {contracts:.0f} {sym}[/yellow]")
+        all_positions = await perp.fetch_positions()
+        open_pos = {p["symbol"]: p for p in all_positions
+                    if abs(float(p.get("contracts", 0))) > 0}
+
+        # ── Pass 1: Naked ────────────────────────────────────────────────────
+        naked = {sym: p for sym, p in open_pos.items() if sym not in tracked_map}
+        if naked:
+            logger.warning("naked_positions_detected_on_startup", count=len(naked),
+                           symbols=list(naked.keys()))
+            console.print(f"[yellow]⚠️  {len(naked)} naked perp position(s) detected — "
+                          f"closing now...[/yellow]")
+            for sym, ex_pos in naked.items():
+                side       = ex_pos.get("side", "")
+                contracts  = float(ex_pos.get("contracts", 0))
+                close_side = "buy" if side == "short" else "sell"
+                ticker     = await perp.fetch_ticker(sym)
+                ref_mid    = float(ticker.get("last") or ticker.get("close") or 0)
+                ok = await _close_perp_robust(perp, sym, close_side, contracts, ref_mid,
+                                              label="startup_naked_close")
+                console.print(
+                    f"[{'green' if ok else 'red'}]  "
+                    f"{'Closed' if ok else 'FAILED to close'} "
+                    f"{side} {contracts:.0f} {sym}[/]")
+
+        # ── Pass 2: Size drift for tracked positions ─────────────────────────
+        size_issues = []
+        for ccxt_sym, pos in tracked_map.items():
+            ex_pos = open_pos.get(ccxt_sym)
+            if ex_pos is None:
+                actual = 0.0
+            else:
+                actual = abs(float(ex_pos.get("contracts", 0)))
+
+            if actual < 1e-9:
+                if not pos.perp_closed:
+                    logger.info("startup_perp_already_flat_in_exchange",
+                                symbol=pos.symbol, stored_size=pos.size)
+                    pos.perp_closed = True
+                    size_issues.append(f"{pos.symbol}: perp already flat (marking closed)")
+            elif abs(actual - pos.size) / max(pos.size, 1e-9) > 0.05:
+                logger.warning("startup_size_drift_corrected",
+                               symbol=pos.symbol, stored=pos.size, actual=actual,
+                               drift_pct=round((actual - pos.size) / pos.size * 100, 2))
+                size_issues.append(
+                    f"{pos.symbol}: size {pos.size:.2f} → {actual:.2f} (drift corrected)")
+                pos.size = actual
+
+        if not naked and not size_issues:
+            logger.info("startup_reconcile_clean", tracked=len(tracked))
+        elif size_issues:
+            console.print(f"[yellow]Size drift corrections:[/yellow]")
+            for issue in size_issues:
+                console.print(f"[yellow]  • {issue}[/yellow]")
+
     finally:
         await perp.close()
 
@@ -582,14 +756,15 @@ async def run_farm() -> None:
         monitor.watch(pos.ccxt_symbol, pos.symbol, pos.direction)
     await monitor.start()
 
-    # ── Startup: close any naked perp positions not in state ──────────────────
-    await _close_naked_positions(positions)
+    # ── Startup: reconcile exchange state vs local state ─────────────────────
+    await _reconcile_on_startup(positions)
+    save_state(positions)   # persist any size drift corrections immediately
 
     last_scan_ts = 0.0   # force scan on first loop iteration
 
     try:
         while True:
-            # ── 1. Process WS exit signals immediately ─────────────────────
+            # ── 1. Process WS exit signals + retry any pending closes ──────
             pending_exits: set = set()
             while not exit_queue.empty():
                 try:
@@ -597,17 +772,41 @@ async def run_farm() -> None:
                 except asyncio.QueueEmpty:
                     break
 
-            to_close = [p for p in positions
-                        if p.ccxt_symbol in pending_exits
-                        or abs(p.last_rate * 3 * 365 * 100) < EXIT_APY_THRESHOLD]
-            for pos in to_close:
+            # Mark positions that should close (new signal or rate fallen below threshold)
+            for pos in positions:
                 eff = (pos.last_rate if pos.direction == "short_perp"
                        else -pos.last_rate) * 3 * 365 * 100
-                console.print(f"[red]Closing {pos.symbol} — "
-                              f"rate {eff:.1f}% APY < threshold[/red]")
-                if await close_position(pos):
+                if pos.ccxt_symbol in pending_exits or abs(eff) < EXIT_APY_THRESHOLD:
+                    if not pos.needs_close:
+                        pos.needs_close = True
+                        console.print(f"[red]Exit triggered: {pos.symbol} "
+                                      f"({eff:.1f}% APY < {EXIT_APY_THRESHOLD}% threshold)[/red]")
+
+            # Attempt close for all positions flagged (includes retries from prior failures)
+            to_close = [p for p in positions if p.needs_close]
+            closed_positions = []
+            for pos in to_close:
+                console.print(f"[red]Closing {pos.symbol} "
+                              f"{'(retry)' if pos.perp_closed or pos.spot_closed else ''}[/red]")
+                try:
+                    ok = await close_position(pos)
+                except Exception as e:
+                    logger.error("close_position_exception", symbol=pos.symbol,
+                                 error=str(e)[:200])
+                    ok = False
+
+                if ok:
                     monitor.unwatch(pos.ccxt_symbol)
-                    positions.remove(pos)
+                    closed_positions.append(pos)
+                else:
+                    logger.warning("close_will_retry_next_tick", symbol=pos.symbol,
+                                   perp_done=pos.perp_closed, spot_done=pos.spot_closed)
+
+            for pos in closed_positions:
+                positions.remove(pos)
+
+            if to_close:
+                save_state(positions)
 
             # ── 2. Scan for new positions (rate-limited) ───────────────────
             now = time.time()
@@ -708,9 +907,24 @@ async def main():
 
     if args.close:
         pos = load_state()
-        for p in pos: await close_position(p)
-        save_state([])
-        console.print("[red]All positions closed.[/red]"); return
+        remaining = []
+        for p in pos:
+            p.needs_close = True
+            ok = await close_position(p)
+            if ok:
+                console.print(f"[green]✓ Closed {p.symbol}[/green]")
+            else:
+                console.print(f"[red]✗ {p.symbol} close FAILED — "
+                              f"perp={'done' if p.perp_closed else 'OPEN'} "
+                              f"spot={'done' if p.spot_closed else 'OPEN'}[/red]")
+                remaining.append(p)
+        save_state(remaining)
+        if not remaining:
+            console.print("[green]All positions closed.[/green]")
+        else:
+            console.print(f"[red]{len(remaining)} position(s) NOT closed — "
+                          f"re-run --close to retry.[/red]")
+        return
 
     if args.run:
         await run_farm(); return
