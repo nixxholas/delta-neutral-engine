@@ -483,6 +483,71 @@ def show_status(positions: list[FarmPosition]) -> None:
     console.print(t)
 
 
+async def _close_naked_positions(tracked: list) -> None:
+    """
+    On startup: find any open perp positions NOT in state and close them.
+    These arise from failed rollbacks (network blips, IP bans, etc.).
+    """
+    tracked_syms = {p.ccxt_symbol for p in tracked}
+    perp = _make_perp_exchange()
+    try:
+        await perp.load_markets()
+        positions = await perp.fetch_positions()
+        naked = [p for p in positions
+                 if abs(float(p.get("contracts", 0))) > 0
+                 and p["symbol"] not in tracked_syms]
+        if not naked:
+            logger.info("startup_check_clean", tracked=len(tracked_syms))
+            return
+        logger.warning("naked_positions_detected_on_startup", count=len(naked),
+                       symbols=[p["symbol"] for p in naked])
+        console.print(f"[yellow]⚠️  {len(naked)} naked position(s) detected — "
+                      f"closing before farm starts...[/yellow]")
+        for pos in naked:
+            sym       = pos["symbol"]
+            side      = pos.get("side", "")
+            contracts = float(pos.get("contracts", 0))
+            close_side = "buy" if side == "short" else "sell"
+            mkt       = perp.market(sym)
+            max_qty   = float((mkt.get("limits") or {}).get("amount", {}).get("max") or contracts)
+            step      = float((mkt.get("precision") or {}).get("amount") or 1.0)
+            ticker    = await perp.fetch_ticker(sym)
+            mark      = float(ticker.get("last") or ticker.get("close") or 0)
+            remaining = contracts
+            chunk_n   = 0
+            while remaining > step * 0.5:
+                chunk   = math.floor(min(remaining, max_qty) / step) * step
+                chunk_n += 1
+                success = False
+                for order_type, price_mult in [("market", None), ("limit", 0.998),
+                                               ("limit", 0.995), ("limit", 0.990)]:
+                    try:
+                        if order_type == "market":
+                            o = await perp.create_order(sym, "market", close_side, chunk,
+                                                        params={"reduceOnly": True})
+                        else:
+                            lp = mark * price_mult
+                            o  = await perp.create_order(sym, "limit", close_side,
+                                                         chunk, lp,
+                                                         params={"reduceOnly": True,
+                                                                 "timeInForce": "GTC"})
+                        logger.info("startup_naked_closed", symbol=sym,
+                                    chunk=chunk_n, order_id=o["id"])
+                        success = True
+                        break
+                    except Exception as e:
+                        logger.warning("startup_close_attempt_failed", symbol=sym,
+                                       method=order_type, error=str(e)[:80])
+                if not success:
+                    logger.error("startup_close_failed_manual_needed", symbol=sym)
+                    break
+                remaining -= chunk
+                await asyncio.sleep(1)
+            console.print(f"[yellow]  Closed {side} {contracts:.0f} {sym}[/yellow]")
+    finally:
+        await perp.close()
+
+
 # ── Main loop ─────────────────────────────────────────────────────────────────
 
 async def run_farm() -> None:
@@ -516,6 +581,9 @@ async def run_farm() -> None:
     for pos in positions:
         monitor.watch(pos.ccxt_symbol, pos.symbol, pos.direction)
     await monitor.start()
+
+    # ── Startup: close any naked perp positions not in state ──────────────────
+    await _close_naked_positions(positions)
 
     last_scan_ts = 0.0   # force scan on first loop iteration
 
