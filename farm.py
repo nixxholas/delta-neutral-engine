@@ -888,14 +888,168 @@ async def run_farm() -> None:
         logger.info("farm_stopped")
 
 
+# ── Spot balance display ──────────────────────────────────────────────────────
+
+async def fetch_spot_data(positions: list[FarmPosition]) -> tuple[float, list[dict]]:
+    """Return (usdt_free, per-position spot data) for display."""
+    spot_ex = _make_spot_exchange()
+    try:
+        await spot_ex.load_markets()
+        bal = await spot_ex.fetch_balance()
+        usdt = float((bal.get("USDT") or {}).get("free") or 0)
+        rows = []
+        for pos in positions:
+            b = float((bal.get(pos.symbol) or {}).get("free") or 0)
+            try:
+                t = await spot_ex.fetch_ticker(pos.spot_symbol)
+                price = float(t.get("last") or t.get("close") or pos.spot_entry_price)
+            except Exception:
+                price = pos.spot_entry_price
+            usd = b * price
+            if pos.direction == "short_perp":
+                hedge_desc = f"Hold ≥{pos.size:.0f}"
+                ok = b >= pos.size * 0.95
+            else:
+                hedge_desc = f"Sold {pos.size:.0f}"
+                ok = True
+            rows.append(dict(
+                sym=pos.symbol, balance=b, usd=usd, price=price,
+                direction=pos.direction, hedge=hedge_desc, ok=ok,
+                apy=pos.entry_apy, earned=pos.funding_collected,
+                age_h=(time.time() - pos.entry_ts) / 3600,
+                rate=pos.last_rate, size=pos.size,
+            ))
+        return usdt, rows
+    finally:
+        await spot_ex.close()
+
+
+def show_balance(usdt: float, rows: list[dict]) -> None:
+    t = Table(title="Spot Hedge Balances")
+    for col in ["Asset", "Balance", "~USD", "Direction", "Hedge", "Status"]:
+        t.add_column(col)
+    for r in rows:
+        status = "[green]✓ OK[/green]" if r["ok"] else "[red]⚠ UNDER[/red]"
+        t.add_row(
+            r["sym"], f"{r['balance']:,.1f}", f"${r['usd']:,.2f}",
+            r["direction"], r["hedge"], status,
+        )
+    console.print(t)
+    console.print(f"\n[cyan]USDT available:[/cyan] ${usdt:,.2f}")
+
+
+def generate_dashboard_html(usdt: float, rows: list[dict]) -> str:
+    import json as _json
+    ts = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    total_earned = sum(r["earned"] for r in rows)
+    total_notional = len(rows) * 500
+
+    rows_json = _json.dumps(rows)
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="refresh" content="60">
+<title>Funding Farm Dashboard</title>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{background:#0b0e1a;color:#e0e6f0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;padding:28px;min-width:900px}}
+  h1{{font-size:20px;font-weight:700;color:#7dd3fc;margin-bottom:4px}}
+  .sub{{font-size:12px;color:#475569;margin-bottom:24px}}
+  .cards{{display:flex;gap:14px;margin-bottom:28px;flex-wrap:wrap}}
+  .card{{background:#141926;border:1px solid #1e2740;border-radius:10px;padding:16px 22px;min-width:150px}}
+  .cl{{font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.5px;margin-bottom:5px}}
+  .cv{{font-size:24px;font-weight:700}}
+  .green{{color:#4ade80}} .blue{{color:#7dd3fc}} .yellow{{color:#fbbf24}}
+  h2{{font-size:13px;font-weight:600;color:#94a3b8;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px}}
+  table{{width:100%;border-collapse:collapse;font-size:13px;margin-bottom:28px}}
+  thead th{{background:#141926;color:#64748b;font-weight:500;text-align:left;padding:9px 12px;border-bottom:1px solid #1e2740;font-size:11px;text-transform:uppercase;letter-spacing:.4px}}
+  tr{{border-bottom:1px solid #11151f}}
+  tr:hover{{background:#0f1420}}
+  td{{padding:9px 12px;vertical-align:middle}}
+  .sym{{font-weight:700;font-size:14px;letter-spacing:.3px}}
+  .mono{{font-family:'SF Mono','Consolas',monospace;font-size:12px}}
+  .badge{{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-weight:600}}
+  .short{{background:#7f1d1d22;color:#f87171;border:1px solid #7f1d1d55}}
+  .long{{background:#14532d22;color:#4ade80;border:1px solid #14532d55}}
+  .ok{{color:#4ade80;font-weight:600}} .warn{{color:#f87171;font-weight:600}}
+  .pos-rate{{font-family:'SF Mono','Consolas',monospace;font-size:12px}}
+  hr{{border:none;border-top:1px solid #1e2740;margin:0 0 24px 0}}
+</style>
+</head>
+<body>
+<h1>⚙️ Funding Farm</h1>
+<p class="sub">Last updated: {ts} &nbsp;·&nbsp; Auto-refreshes every 60s</p>
+
+<div class="cards">
+  <div class="card"><div class="cl">USDT Free</div><div class="cv blue">${usdt:,.2f}</div></div>
+  <div class="card"><div class="cl">Open Positions</div><div class="cv">{len(rows)}</div></div>
+  <div class="card"><div class="cl">Est. Funding Earned</div><div class="cv green">${total_earned:,.4f}</div></div>
+  <div class="card"><div class="cl">Total Notional</div><div class="cv yellow">${total_notional:,}</div></div>
+</div>
+
+<h2>Perp Positions</h2>
+<table>
+<thead><tr><th>Symbol</th><th>Direction</th><th>Notional</th><th>Age</th><th>Entry APY</th><th>Rate/8h</th><th>Est. Earned</th></tr></thead>
+<tbody id="perp-body"></tbody>
+</table>
+
+<hr>
+<h2>Spot Hedge Legs</h2>
+<table>
+<thead><tr><th>Asset</th><th>Balance</th><th>~USD Value</th><th>Hedge Type</th><th>Required</th><th>Status</th></tr></thead>
+<tbody id="spot-body"></tbody>
+</table>
+
+<script>
+const rows = {rows_json};
+const pb = document.getElementById("perp-body");
+const sb = document.getElementById("spot-body");
+rows.forEach(function(r) {{
+  const dir = r.direction === "short_perp";
+  const age = r.age_h >= 24 ? (r.age_h/24).toFixed(1)+"d" : r.age_h.toFixed(1)+"h";
+  const rc  = r.rate >= 0 ? "#4ade80" : "#f87171";
+  const bdg = dir ? "short" : "long";
+  const dlabel = dir ? "SHORT perp" : "LONG perp";
+  pb.innerHTML +=
+    "<tr>" +
+    "<td class='sym'>" + r.sym + "</td>" +
+    "<td><span class='badge " + bdg + "'>" + dlabel + "</span></td>" +
+    "<td class='mono'>$500</td>" +
+    "<td class='mono'>" + age + "</td>" +
+    "<td class='mono'>" + r.apy.toFixed(0) + "%</td>" +
+    "<td class='mono pos-rate' style='color:" + rc + "'>" + (r.rate*100).toFixed(4) + "%</td>" +
+    "<td class='mono green'>$" + r.earned.toFixed(4) + "</td>" +
+    "</tr>";
+  const hedgeType = dir ? "Hold tokens" : "Sell tokens short";
+  const stCls = r.ok ? "ok" : "warn";
+  const stTxt = r.ok ? "&#10003; Hedged" : "&#9888; CHECK";
+  sb.innerHTML +=
+    "<tr>" +
+    "<td class='sym'>" + r.sym + "</td>" +
+    "<td class='mono'>" + r.balance.toLocaleString() + "</td>" +
+    "<td class='mono'>$" + r.usd.toFixed(2) + "</td>" +
+    "<td>" + hedgeType + "</td>" +
+    "<td class='mono'>" + r.hedge + "</td>" +
+    "<td class='" + stCls + "'>" + stTxt + "</td>" +
+    "</tr>";
+}});
+</script>
+</body>
+</html>"""
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 async def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--run",    action="store_true")
-    p.add_argument("--status", action="store_true")
-    p.add_argument("--close",  action="store_true")
-    p.add_argument("--scan",   action="store_true")
+    p.add_argument("--run",       action="store_true")
+    p.add_argument("--status",    action="store_true")
+    p.add_argument("--close",     action="store_true")
+    p.add_argument("--scan",      action="store_true")
+    p.add_argument("--balance",   action="store_true", help="Show spot hedge balances")
+    p.add_argument("--dashboard", action="store_true", help="Open HTML dashboard in browser")
     args = p.parse_args()
 
     if args.scan:
@@ -904,6 +1058,24 @@ async def main():
 
     if args.status:
         pos = load_state(); await refresh_funding(pos); show_status(pos); return
+
+    if args.balance:
+        pos = load_state()
+        usdt, rows = await fetch_spot_data(pos)
+        show_balance(usdt, rows)
+        return
+
+    if args.dashboard:
+        import webbrowser
+        pos = load_state()
+        await refresh_funding(pos)
+        usdt, rows = await fetch_spot_data(pos)
+        html = generate_dashboard_html(usdt, rows)
+        out = Path("/tmp/farm-dashboard.html")
+        out.write_text(html)
+        console.print(f"[cyan]Dashboard written → {out}[/cyan]")
+        webbrowser.open(f"file://{out}")
+        return
 
     if args.close:
         pos = load_state()
