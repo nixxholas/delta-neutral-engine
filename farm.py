@@ -139,9 +139,15 @@ def save_state(positions: list[FarmPosition]) -> None:
 
 def _make_perp_exchange():
     import ccxt.async_support as ccxt
+    key_path = os.getenv("BINANCE_PRIVATE_KEY_PATH", "")
+    if key_path and os.path.exists(key_path):
+        with open(key_path) as f:
+            secret = f.read()
+    else:
+        secret = os.getenv("BINANCE_API_SECRET", "")
     ex = ccxt.binanceusdm({
         "apiKey": os.getenv("BINANCE_API_KEY", ""),
-        "secret": os.getenv("BINANCE_API_SECRET", ""),
+        "secret": secret,
         "options": {"defaultType": "future"},
         "enableRateLimit": True,
         "rateLimit": 100,       # 10 req/s — well under Binance 1200/min weight limit
@@ -163,7 +169,9 @@ def _make_perp_exchange():
 def _make_spot_exchange():
     import ccxt.async_support as ccxt
 
-    key_path = os.getenv("BINANCE_SPOT_PRIVATE_KEY_PATH", "")
+    # Ed25519 key: prefer SPOT-specific path, fall back to shared BINANCE_PRIVATE_KEY_PATH
+    key_path = (os.getenv("BINANCE_SPOT_PRIVATE_KEY_PATH", "") or
+                os.getenv("BINANCE_PRIVATE_KEY_PATH", ""))
     config: dict = {
         "apiKey": SPOT_API_KEY,
         "options": {"defaultType": "spot"},
