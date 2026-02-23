@@ -83,7 +83,8 @@ async def _with_retry(coro_fn, *, label="op", max_attempts=5, base_delay=2.0):
             await asyncio.sleep(wait)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-POSITION_SIZE_USDT = float(os.getenv("FARM_SIZE_USDT",        "500"))
+POSITION_SIZE_USDT = float(os.getenv("FARM_SIZE_USDT",        "50"))   # min per position
+MAX_POSITION_SIZE  = float(os.getenv("FARM_MAX_SIZE_USDT",    "0"))    # 0 = no cap
 MIN_ENTRY_APY      = float(os.getenv("FARM_MIN_ENTRY_APY",    "15"))
 EXIT_APY_THRESHOLD = float(os.getenv("FARM_EXIT_APY",         "5"))
 SCAN_INTERVAL_S    = int(  os.getenv("FARM_SCAN_INTERVAL",    "1800"))
@@ -91,6 +92,25 @@ MAX_POSITIONS      = int(  os.getenv("FARM_MAX_POSITIONS",    "3"))
 MIN_VOLUME_USD     = float(os.getenv("FARM_MIN_VOLUME_USD",   "0"))
 BLACKLIST: set     = {s.strip().upper()
                       for s in os.getenv("FARM_BLACKLIST", "").split(",") if s.strip()}
+
+
+def _calc_effective_size(available_usdt: float, free_slots: int) -> float:
+    """
+    Progressive capital deployment: divide available capital across remaining slots.
+    Ensures full capital efficiency — idle USDT trends toward zero as slots fill.
+
+    available_usdt  : capital available for new positions (margin or spot USDT)
+    free_slots      : MAX_POSITIONS - current open positions
+    Returns         : per-position size in USDT, bounded by [POSITION_SIZE_USDT, MAX_POSITION_SIZE]
+    """
+    if free_slots <= 0:
+        return POSITION_SIZE_USDT
+    # Divide by free_slots (not free_slots+1) — deploy fully across available slots
+    ideal = available_usdt / free_slots
+    size  = max(POSITION_SIZE_USDT, ideal)
+    if MAX_POSITION_SIZE > 0:
+        size = min(MAX_POSITION_SIZE, size)
+    return math.floor(size)   # round down to whole USDT
 
 # Spot exchange credentials (defaults to same keys as futures — works on mainnet)
 SPOT_API_KEY    = os.getenv("BINANCE_SPOT_API_KEY")    or os.getenv("BINANCE_API_KEY",    "")
@@ -369,7 +389,7 @@ async def _get_mid(ex, symbol: str) -> Optional[float]:
 
 # ── Open both legs ────────────────────────────────────────────────────────────
 
-async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
+async def open_position(opp: FundingOpp, size_usdt: Optional[float] = None) -> Optional[FarmPosition]:
     """Open perp + spot legs simultaneously (asyncio.gather)."""
     spot_symbol = opp.symbol + "/USDT"
 
@@ -392,9 +412,11 @@ async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
             logger.error("open_no_price", symbol=opp.symbol)
             return None
 
+        effective_usdt = size_usdt if size_usdt else POSITION_SIZE_USDT
+
         # Calc perp size
         perp_mkt  = perp_ex.market(opp.ccxt_symbol)
-        perp_size = _calc_size(perp_mkt, mid, POSITION_SIZE_USDT)
+        perp_size = _calc_size(perp_mkt, mid, effective_usdt)
         if not perp_size:
             logger.warning("open_size_invalid", symbol=opp.symbol, mid=mid)
             return None
@@ -1123,10 +1145,16 @@ async def run_farm() -> None:
                         break
                     if opp.symbol in existing:
                         continue
+
+                    # Dynamic position sizing: deploy available capital across remaining slots
+                    free_slots   = MAX_POSITIONS - len(positions)
+                    budget       = margin_usdt if opp.direction == "long_perp" else spot_usdt
+                    eff_size     = _calc_effective_size(budget, free_slots)
                     console.print(f"[green]→ {opp.symbol} {opp.apy:.0f}% APY "
-                                  f"({opp.rate_8h*100:+.4f}%/8h)[/green]")
+                                  f"({opp.rate_8h*100:+.4f}%/8h) "
+                                  f"[dim]size=${eff_size:.0f}[/dim][/green]")
                     try:
-                        pos = await open_position(opp)
+                        pos = await open_position(opp, size_usdt=eff_size)
                     except Exception as e:
                         logger.warning("open_error", symbol=opp.symbol, error=str(e)[:150])
                         pos = None
@@ -1135,6 +1163,11 @@ async def run_farm() -> None:
                         positions.append(pos)
                         monitor.watch(pos.ccxt_symbol, pos.symbol, pos.direction)
                         existing.add(pos.symbol)
+                        # Update margin_usdt estimate (proceeds added from short sell)
+                        if opp.direction == "long_perp":
+                            margin_usdt += pos.notional_usdt
+                        else:
+                            spot_usdt   -= pos.notional_usdt
                         legs = "perp+spot ✓" if pos.spot_leg_live else "perp-only"
                         console.print(f"[green]  Opened ${pos.notional_usdt:.0f} "
                                       f"— {legs}[/green]")
