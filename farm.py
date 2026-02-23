@@ -233,9 +233,19 @@ async def _fetch_margin_usdt() -> float:
         await ex.close()
 
 
+async def _repay_margin_loan(ex, asset: str, qty: float) -> None:
+    """Repay a cross-margin loan. Called on error cleanup to avoid dangling borrows."""
+    try:
+        await ex.sapi_post_margin_repay({"asset": asset, "amount": str(qty)})
+        logger.info("margin_loan_repaid_cleanup", asset=asset, qty=qty)
+    except Exception as e:
+        logger.error("margin_loan_repay_failed_MANUAL_REQUIRED",
+                     asset=asset, qty=qty, error=str(e)[:120])
+
+
 async def _open_spot_margin_short(
     ex,           # margin exchange (defaultType=margin)
-    symbol: str,  # e.g. "LA/USDT"
+    symbol: str,  # e.g. "XRP/USDT"
     qty: float,
     ref_mid: float,
 ) -> tuple[str, float]:
@@ -243,28 +253,46 @@ async def _open_spot_margin_short(
     Borrow base asset from cross-margin pool and sell it (short-sell).
     Used for long_perp direction: long perp + short spot = delta neutral.
     Returns (order_id, fill_price).
+    If sell fails after borrow succeeds, repays the loan before raising.
     """
     base = symbol.split("/")[0]
     mkt  = ex.market(symbol)
-    step = float((mkt.get("precision") or {}).get("amount") or 0.001)
-    loan_qty = math.floor(qty / step) * step
+    # Use exchange precision formatter to avoid floating-point string issues
+    step      = float((mkt.get("precision") or {}).get("amount") or 0.001)
+    loan_qty  = math.floor(qty / step) * step
+    loan_qty  = float(ex.amount_to_precision(symbol, loan_qty))
 
-    # Step 1: borrow the token
+    # Step 1: borrow the token (cross-margin, no isIsolated needed for cross)
     await _with_retry(
-        lambda: ex.sapi_post_margin_loan({
-            "asset": base, "amount": str(loan_qty), "isIsolated": "FALSE"
-        }),
+        lambda: ex.sapi_post_margin_loan({"asset": base, "amount": str(loan_qty)}),
         label=f"margin_borrow:{symbol}")
     logger.info("margin_borrowed", symbol=symbol, qty=loan_qty)
 
-    # Step 2: sell it via margin account
-    order = await _with_retry(
-        lambda: ex.create_order(symbol, "market", "sell", loan_qty,
-                                params={"isIsolated": "FALSE"}),
-        label=f"margin_sell:{symbol}")
-    fill = float(order.get("average") or order.get("price") or ref_mid)
-    logger.info("margin_sold", symbol=symbol, qty=loan_qty, fill=fill)
-    return str(order["id"]), fill
+    # Step 2: sell via cross-margin using SAPI endpoint directly
+    # (ccxt's create_order with defaultType=margin routes incorrectly for cross-margin sells)
+    binance_sym = symbol.replace("/", "")  # e.g. XRP/USDT → XRPUSDT
+    try:
+        order = await _with_retry(
+            lambda: ex.sapi_post_margin_order({
+                "symbol":   binance_sym,
+                "side":     "SELL",
+                "type":     "MARKET",
+                "quantity": str(loan_qty),
+            }),
+            label=f"margin_sell:{symbol}")
+    except Exception as e:
+        # Borrow succeeded but sell failed — repay immediately to avoid dangling loan
+        logger.error("margin_sell_failed_repaying_loan", symbol=symbol, error=str(e)[:140])
+        await _repay_margin_loan(ex, base, loan_qty)
+        raise
+
+    fills  = order.get("fills") or []
+    fill   = (sum(float(f["price"]) * float(f["qty"]) for f in fills) /
+              sum(float(f["qty"]) for f in fills)) if fills else float(
+              order.get("price") or ref_mid)
+    logger.info("margin_sold", symbol=symbol, qty=loan_qty, fill=fill,
+                order_id=order.get("orderId"))
+    return str(order.get("orderId", "")), fill
 
 
 async def _close_spot_margin_short(
@@ -292,10 +320,15 @@ async def _close_spot_margin_short(
         ticker = await ex.fetch_ticker(symbol)
         ref = float(ticker.get("last") or ticker.get("close") or ref_mid)
 
+        binance_sym = symbol.replace("/", "")
         order = await _with_retry(
-            lambda: ex.create_order(symbol, "market", "buy", buy_qty,
-                                    params={"sideEffectType": "AUTO_REPAY",
-                                            "isIsolated": "FALSE"}),
+            lambda: ex.sapi_post_margin_order({
+                "symbol":         binance_sym,
+                "side":           "BUY",
+                "type":           "MARKET",
+                "quantity":       str(buy_qty),
+                "sideEffectType": "AUTO_REPAY",
+            }),
             label=f"margin_repay:{symbol}")
         logger.info("margin_repaid", symbol=symbol, qty=buy_qty,
                     fill=order.get("average") or ref)
@@ -874,6 +907,34 @@ async def _reconcile_on_startup(tracked: list) -> None:
 
     finally:
         await perp.close()
+
+    # ── Cross-margin loan cleanup ─────────────────────────────────────────────
+    # Repay any dangling loans not covered by active tracked positions.
+    # Arises from failed open attempts where borrow succeeded but sell failed.
+    if not SPOT_TESTNET:
+        active_borrows = {p.symbol for p in tracked if p.spot_is_margin and p.spot_leg_live}
+        spot = _make_spot_exchange()
+        try:
+            await spot.load_markets()
+            resp = await spot.sapi_get_margin_account()
+            dangling = [(a["asset"], float(a["borrowed"]))
+                        for a in resp.get("userAssets", [])
+                        if float(a.get("borrowed") or 0) > 1e-6
+                        and a["asset"] not in active_borrows]
+            if dangling:
+                logger.warning("startup_dangling_margin_loans", loans=dangling)
+                console.print(f"[yellow]⚠️  Repaying {len(dangling)} dangling margin loan(s)…[/yellow]")
+                for asset, amount in dangling:
+                    free = float(next(
+                        (a["free"] for a in resp["userAssets"] if a["asset"] == asset), 0))
+                    repay = min(amount, free)
+                    if repay > 1e-8:
+                        await spot.sapi_post_margin_repay({"asset": asset, "amount": str(repay)})
+                        console.print(f"[yellow]  ✓ Repaid {repay:.6f} {asset}[/yellow]")
+        except Exception as e:
+            logger.warning("startup_margin_cleanup_failed", error=str(e)[:120])
+        finally:
+            await spot.close()
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────
