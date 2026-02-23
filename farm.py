@@ -537,12 +537,11 @@ async def run_farm() -> None:
                     # Need USDT to buy spot
                     return spot_usdt >= POSITION_SIZE_USDT * 0.9
                 else:
-                    # long_perp: need to short spot → must hold the token
-                    held = spot_balances.get(opp.symbol, 0.0)
-                    # Estimate required qty (rough: size / current rate won't work,
-                    # use volume as a proxy — just check any nonzero balance >= 50% of notional)
-                    return held > 0   # any holding is a positive signal; farm will size properly
-                                      # if still insufficient, spot leg fails and rolls back cleanly
+                    # long_perp: need to short spot → must hold enough of the token
+                    held  = spot_balances.get(opp.symbol, 0.0)
+                    price = opp.mid_price or 1.0
+                    held_usdt = held * price
+                    return held_usdt >= POSITION_SIZE_USDT * 0.9
 
             opps = [o for o in opps if _can_execute(o)]
             console.print(f"[dim]  {len(opps)} opps pass spot pre-filter "

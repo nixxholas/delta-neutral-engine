@@ -34,6 +34,7 @@ class FundingOpp:
     direction: str           # "short_perp" | "long_perp"
     volume_24h_usdt: float
     next_funding_ts: Optional[float] = None
+    mid_price: float = 0.0   # last known price (from bulk ticker)
 
 
 def _make_ex() -> ccxt.binanceusdm:
@@ -71,8 +72,8 @@ async def scan(min_apy: float = 0.0, top_n: int = 50) -> List[FundingOpp]:
         # /fapi/v1/premiumIndex returns all symbols at once
         raw_rates = await _bulk_funding_rates(ex)
 
-        # ── 2. Bulk 24h volumes (single request) ──────────────────────────────
-        raw_vols  = await _bulk_volumes(ex)
+        # ── 2. Bulk 24h volumes + prices (single request) ─────────────────────
+        raw_vols, raw_prices = await _bulk_volumes(ex)
 
         # ── 3. Build opportunities ─────────────────────────────────────────────
         results: List[FundingOpp] = []
@@ -93,7 +94,8 @@ async def scan(min_apy: float = 0.0, top_n: int = 50) -> List[FundingOpp]:
                 continue
 
             base   = mkt.get("base", sym_raw.replace("USDT", ""))
-            vol    = raw_vols.get(sym_raw, 0.0)
+            vol   = raw_vols.get(sym_raw, 0.0)
+            price = raw_prices.get(sym_raw, 0.0)
             if vol < MIN_VOLUME_USDT:
                 continue
 
@@ -109,6 +111,7 @@ async def scan(min_apy: float = 0.0, top_n: int = 50) -> List[FundingOpp]:
                 direction       = "short_perp" if rate >= 0 else "long_perp",
                 volume_24h_usdt = vol,
                 next_funding_ts = next_ts or None,
+                mid_price       = price,
             ))
 
         results.sort(key=lambda x: abs(x.apy), reverse=True)
@@ -142,21 +145,21 @@ async def _bulk_funding_rates(ex: ccxt.binanceusdm) -> list:
             return []
 
 
-async def _bulk_volumes(ex: ccxt.binanceusdm) -> dict:
+async def _bulk_volumes(ex: ccxt.binanceusdm):
     """
-    Returns {rawSymbol: quoteVolume} for all USDT-M perps.
+    Returns ({rawSymbol: quoteVolume}, {rawSymbol: lastPrice}) for all USDT-M perps.
     Single call to /fapi/v1/ticker/24hr.
     """
     try:
         tickers = await ex.fetch_tickers()
-        result = {}
+        vols, prices = {}, {}
         for sym, t in tickers.items():
             raw = sym.replace("/USDT:USDT", "USDT")
-            vol = float(t.get("quoteVolume") or t.get("baseVolume") or 0)
-            result[raw] = vol
-        return result
+            vols[raw]   = float(t.get("quoteVolume") or t.get("baseVolume") or 0)
+            prices[raw] = float(t.get("last") or t.get("close") or 0)
+        return vols, prices
     except Exception:
-        return {}
+        return {}, {}
 
 
 def print_table(opps: List[FundingOpp]) -> None:
