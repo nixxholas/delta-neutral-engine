@@ -83,34 +83,85 @@ async def _with_retry(coro_fn, *, label="op", max_attempts=5, base_delay=2.0):
             await asyncio.sleep(wait)
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-POSITION_SIZE_USDT = float(os.getenv("FARM_SIZE_USDT",        "50"))   # min per position
-MAX_POSITION_SIZE  = float(os.getenv("FARM_MAX_SIZE_USDT",    "0"))    # 0 = no cap
-MIN_ENTRY_APY      = float(os.getenv("FARM_MIN_ENTRY_APY",    "15"))
-EXIT_APY_THRESHOLD = float(os.getenv("FARM_EXIT_APY",         "5"))
-SCAN_INTERVAL_S    = int(  os.getenv("FARM_SCAN_INTERVAL",    "1800"))
-MAX_POSITIONS      = int(  os.getenv("FARM_MAX_POSITIONS",    "3"))
-MIN_VOLUME_USD     = float(os.getenv("FARM_MIN_VOLUME_USD",   "0"))
+POSITION_SIZE_USDT = float(os.getenv("FARM_SIZE_USDT",          "50"))   # min per position
+MAX_POSITION_SIZE  = float(os.getenv("FARM_MAX_SIZE_USDT",      "0"))    # 0 = no cap
+MIN_ENTRY_APY      = float(os.getenv("FARM_MIN_ENTRY_APY",      "15"))
+EXIT_APY_THRESHOLD = float(os.getenv("FARM_EXIT_APY",           "5"))
+SCAN_INTERVAL_S    = int(  os.getenv("FARM_SCAN_INTERVAL",      "1800"))
+MAX_POSITIONS      = int(  os.getenv("FARM_MAX_POSITIONS",      "3"))
+MIN_VOLUME_USD     = float(os.getenv("FARM_MIN_VOLUME_USD",     "0"))
 BLACKLIST: set     = {s.strip().upper()
                       for s in os.getenv("FARM_BLACKLIST", "").split(",") if s.strip()}
+
+# ── Fee & cost constants ───────────────────────────────────────────────────────
+# Binance standard fees: perp taker 0.04%, spot/margin taker 0.10%
+PERP_TAKER_FEE     = float(os.getenv("FARM_PERP_TAKER_FEE",    "0.0004"))  # 0.04%
+SPOT_TAKER_FEE     = float(os.getenv("FARM_SPOT_TAKER_FEE",    "0.0010"))  # 0.10%
+# Entry cost = one perp leg + one spot leg (both market orders)
+ENTRY_FEE_PCT      = PERP_TAKER_FEE + SPOT_TAKER_FEE              # 0.14%
+# Full round-trip (open + close)
+RT_FEE_PCT         = 2.0 * ENTRY_FEE_PCT                          # 0.28%
+# Estimated cross-margin borrow rate — conservative (actual varies; ~7–15% for major tokens)
+BORROW_RATE_APY    = float(os.getenv("FARM_BORROW_RATE_APY",   "10.0")) / 100.0
+# Reject if entry fees won't break even within this many days (0 = no gate)
+MAX_BREAKEVEN_DAYS = float(os.getenv("FARM_MAX_BREAKEVEN_DAYS", "30.0"))
+
+
+def _net_apy(gross_apy_pct: float) -> float:
+    """Net APY after borrow cost. gross_apy_pct is the absolute (unsigned) funding APY."""
+    return abs(gross_apy_pct) - (BORROW_RATE_APY * 100.0)
+
+
+def _daily_net_usdt(notional: float, gross_apy_pct: float) -> float:
+    """Expected net daily earnings (after borrow) for a given notional and gross APY."""
+    return notional * (_net_apy(gross_apy_pct) / 100.0) / 365.0
+
+
+def _breakeven_days(gross_apy_pct: float) -> float:
+    """
+    Days to recover entry fees at the given net APY.
+    Returns inf if net APY ≤ 0 (never profitable).
+    """
+    net = _net_apy(gross_apy_pct) / 100.0
+    if net <= 0:
+        return float("inf")
+    # entry_fee = ENTRY_FEE_PCT × notional; daily_net = notional × net / 365
+    # breakeven = entry_fee / daily_net = ENTRY_FEE_PCT × 365 / net
+    return (ENTRY_FEE_PCT * 365.0) / net
 
 
 def _calc_effective_size(available_usdt: float, free_slots: int) -> float:
     """
-    Progressive capital deployment: divide available capital across remaining slots.
-    Ensures full capital efficiency — idle USDT trends toward zero as slots fill.
-
-    available_usdt  : capital available for new positions (margin or spot USDT)
-    free_slots      : MAX_POSITIONS - current open positions
-    Returns         : per-position size in USDT, bounded by [POSITION_SIZE_USDT, MAX_POSITION_SIZE]
+    Equal-split fallback: divide available capital across remaining slots.
+    Prefer _apy_weighted_sizes() for multi-opp allocation.
     """
     if free_slots <= 0:
         return POSITION_SIZE_USDT
-    # Divide by free_slots (not free_slots+1) — deploy fully across available slots
     ideal = available_usdt / free_slots
     size  = max(POSITION_SIZE_USDT, ideal)
     if MAX_POSITION_SIZE > 0:
         size = min(MAX_POSITION_SIZE, size)
-    return math.floor(size)   # round down to whole USDT
+    return math.floor(size)
+
+
+def _apy_weighted_sizes(budget: float, opps: list) -> list:
+    """
+    Allocate budget across opps proportional to |APY| (highest APY → most capital).
+    Returns a list of (opp, size_usdt) tuples in opp order.
+    Each size bounded by [POSITION_SIZE_USDT, MAX_POSITION_SIZE].
+    """
+    if not opps:
+        return []
+    total_apy = sum(abs(o.apy) for o in opps) or 1.0
+    result = []
+    for o in opps:
+        weight = abs(o.apy) / total_apy
+        ideal  = budget * weight
+        size   = max(POSITION_SIZE_USDT, ideal)
+        if MAX_POSITION_SIZE > 0:
+            size = min(MAX_POSITION_SIZE, size)
+        result.append((o, math.floor(size)))
+    return result
 
 # Spot exchange credentials (defaults to same keys as futures — works on mainnet)
 SPOT_API_KEY    = os.getenv("BINANCE_SPOT_API_KEY")    or os.getenv("BINANCE_API_KEY",    "")
@@ -143,6 +194,8 @@ class FarmPosition:
     perp_closed:       bool    = False   # True = perp leg confirmed closed
     spot_closed:       bool    = False   # True = spot leg confirmed closed
     spot_is_margin:    bool    = False   # True = spot leg used cross-margin (long_perp)
+    entry_fee_usdt:    float   = 0.0    # fees paid to open (perp + spot taker)
+    borrow_accrued:    float   = 0.0    # cumulative borrow interest (long_perp only)
 
 
 def load_state() -> list[FarmPosition]:
@@ -468,6 +521,8 @@ async def open_position(opp: FundingOpp, size_usdt: Optional[float] = None) -> O
             await _rollback_perp(perp_ex, opp.ccxt_symbol, perp_side, perp_size, mid)
             return None
 
+        _notional = perp_size * perp_fill
+        _fee_pct  = PERP_TAKER_FEE + (SPOT_TAKER_FEE if spot_live else 0.0)
         pos = FarmPosition(
             symbol           = opp.symbol,
             ccxt_symbol      = opp.ccxt_symbol,
@@ -478,7 +533,7 @@ async def open_position(opp: FundingOpp, size_usdt: Optional[float] = None) -> O
             perp_entry_price = perp_fill,
             spot_entry_price = spot_fill,
             size             = perp_size,
-            notional_usdt    = perp_size * perp_fill,
+            notional_usdt    = _notional,
             entry_rate_8h    = opp.rate_8h,
             entry_apy        = opp.apy,
             entry_ts         = time.time(),
@@ -486,6 +541,7 @@ async def open_position(opp: FundingOpp, size_usdt: Optional[float] = None) -> O
             spot_is_margin   = spot_margin,
             last_rate        = opp.rate_8h,
             last_rate_ts     = time.time(),
+            entry_fee_usdt   = round(_notional * _fee_pct, 6),
         )
 
         legs = ("perp+margin_short" if spot_margin
@@ -827,6 +883,10 @@ async def refresh_funding(positions: list[FarmPosition]) -> None:
                 elapsed_8h = (time.time() - pos.entry_ts) / (8 * 3600)
                 sign = 1 if pos.direction == "short_perp" else -1
                 pos.funding_collected = pos.notional_usdt * pos.entry_rate_8h * elapsed_8h * sign
+                # Accrue borrow cost (only for long_perp which has margin short leg)
+                if pos.spot_is_margin or pos.direction == "long_perp":
+                    elapsed_days = (time.time() - pos.entry_ts) / 86400.0
+                    pos.borrow_accrued = pos.notional_usdt * BORROW_RATE_APY / 365.0 * elapsed_days
             except Exception as e:
                 logger.warning("refresh_funding_error", symbol=pos.symbol, error=str(e))
     finally:
@@ -836,23 +896,78 @@ async def refresh_funding(positions: list[FarmPosition]) -> None:
 # ── Display ───────────────────────────────────────────────────────────────────
 
 def show_status(positions: list[FarmPosition]) -> None:
+    _con = Console(width=160)   # wide console so columns don't truncate
     if not positions:
-        console.print("[yellow]No active farm positions.[/yellow]")
+        _con.print("[yellow]No active farm positions.[/yellow]")
         return
-    t = Table(title="Active Funding Farm Positions")
-    for col in ["Symbol", "Strategy", "Notional", "Legs", "Entry APY",
-                "Cur Rate/8h", "Est. Funding Earned", "Age"]:
-        t.add_column(col)
+
+    # ── Summary stats ─────────────────────────────────────────────────────────
+    total_notional   = sum(p.notional_usdt for p in positions)
+    total_funding    = sum(p.funding_collected for p in positions)
+    total_borrow     = sum(p.borrow_accrued for p in positions)
+    total_fees_paid  = sum(p.entry_fee_usdt for p in positions)
+    total_net_pnl    = total_funding - total_borrow - total_fees_paid
+    weighted_net_apy = (
+        sum(p.notional_usdt * _net_apy(p.entry_apy) for p in positions) / total_notional
+        if total_notional > 0 else 0.0
+    )
+    daily_net_est    = sum(_daily_net_usdt(p.notional_usdt, p.entry_apy) for p in positions)
+
+    # ── Per-position table ─────────────────────────────────────────────────────
+    t = Table(title="⚙️  Active Funding Farm Positions")
+    for col, justify, style in [
+        ("Sym",       "left",  "bold"),
+        ("Notional",  "right", ""),
+        ("Gross%",    "right", ""),
+        ("Net%",      "right", ""),
+        ("$/day",     "right", "green"),
+        ("BE",        "right", ""),
+        ("Fund$",     "right", "green"),
+        ("Borrow$",   "right", "dim"),
+        ("Net P&L",   "right", ""),
+        ("Rate/8h",   "right", ""),
+        ("Age",       "right", "dim"),
+    ]:
+        t.add_column(col, justify=justify, style=style)
+
     for p in positions:
-        age_h  = (time.time() - p.entry_ts) / 3600
-        strat  = "Short perp" if p.direction == "short_perp" else "Long perp"
-        legs   = "perp+spot" if p.spot_leg_live else "perp-only"
+        age_h     = (time.time() - p.entry_ts) / 3600
+        net_apy   = _net_apy(p.entry_apy)
+        daily_net = _daily_net_usdt(p.notional_usdt, p.entry_apy)
+        be_days   = _breakeven_days(p.entry_apy)
+        net_pnl   = p.funding_collected - p.borrow_accrued - p.entry_fee_usdt
+
+        be_str    = f"{be_days:.1f}d" if be_days < 999 else "∞"
+        net_apy_color = "green" if net_apy > 0 else "red"
+        pnl_color     = "green" if net_pnl >= 0 else "red"
+
+        age_str = f"{age_h/24:.1f}d" if age_h >= 24 else f"{age_h:.1f}h"
+
         t.add_row(
-            p.symbol, strat, f"${p.notional_usdt:.0f}", legs,
-            f"{p.entry_apy:.1f}%", f"{p.last_rate*100:+.4f}%",
-            f"${p.funding_collected:.4f}", f"{age_h:.1f}h",
+            p.symbol,
+            f"${p.notional_usdt:.0f}",
+            f"{p.entry_apy:.1f}%",
+            f"[{net_apy_color}]{net_apy:.1f}%[/{net_apy_color}]",
+            f"${daily_net:.4f}",
+            be_str,
+            f"${p.funding_collected:.4f}",
+            f"${p.borrow_accrued:.4f}",
+            f"[{pnl_color}]${net_pnl:.4f}[/{pnl_color}]",
+            f"{p.last_rate*100:+.4f}%",
+            age_str,
         )
-    console.print(t)
+    _con.print(t)
+
+    # ── Portfolio summary line ─────────────────────────────────────────────────
+    net_color = "green" if total_net_pnl >= 0 else "red"
+    _con.print(
+        f"  [dim]Total notional: [/dim][bold]${total_notional:.0f}[/bold]"
+        f"  [dim]|  Portfolio net APY: [/dim][bold]{weighted_net_apy:.1f}%[/bold]"
+        f"  [dim]|  Est. daily net: [/dim][bold]${daily_net_est:.4f}[/bold]"
+        f"  [dim]|  Net P&L: [/dim][{net_color}][bold]${total_net_pnl:.4f}[/bold][/{net_color}]"
+        f"  [dim]  (funding ${total_funding:.4f} − borrow ${total_borrow:.4f}"
+        f" − fees ${total_fees_paid:.4f})[/dim]"
+    )
 
 
 async def _reconcile_on_startup(tracked: list) -> None:
@@ -1140,19 +1255,49 @@ async def run_farm() -> None:
                 console.print(f"[dim]  {len(opps)} opps pass filter "
                               f"(spot=${spot_usdt:.0f}, margin=${margin_usdt:.0f})[/dim]")
 
+                # ── APY-weighted sizing ────────────────────────────────────────
+                # Allocate capital proportional to |APY| — highest-returning
+                # opportunities get the most capital.
+                new_opps = [o for o in opps if o.symbol not in existing
+                            and len(positions) < MAX_POSITIONS]
+                if new_opps:
+                    # Separate by leg type (separate budgets)
+                    lp_opps = [o for o in new_opps if o.direction == "long_perp"]
+                    sp_opps = [o for o in new_opps if o.direction == "short_perp"]
+                    lp_sizes = dict(_apy_weighted_sizes(margin_usdt, lp_opps))
+                    sp_sizes = dict(_apy_weighted_sizes(spot_usdt,   sp_opps))
+                    opp_sizes = {**lp_sizes, **sp_sizes}
+                else:
+                    opp_sizes = {}
+
                 for opp in opps:
                     if len(positions) >= MAX_POSITIONS:
                         break
                     if opp.symbol in existing:
                         continue
 
-                    # Dynamic position sizing: deploy available capital across remaining slots
-                    free_slots   = MAX_POSITIONS - len(positions)
-                    budget       = margin_usdt if opp.direction == "long_perp" else spot_usdt
-                    eff_size     = _calc_effective_size(budget, free_slots)
-                    console.print(f"[green]→ {opp.symbol} {opp.apy:.0f}% APY "
-                                  f"({opp.rate_8h*100:+.4f}%/8h) "
-                                  f"[dim]size=${eff_size:.0f}[/dim][/green]")
+                    eff_size = opp_sizes.get(opp, POSITION_SIZE_USDT)
+
+                    # ── Min viable check: reject if net APY ≤ 0 ──────────────
+                    net = _net_apy(opp.apy)
+                    be  = _breakeven_days(opp.apy)
+                    if net <= 0:
+                        console.print(
+                            f"[yellow]  Skipping {opp.symbol} {opp.apy:.0f}% APY — "
+                            f"net APY {net:.1f}% ≤ 0 after ~{BORROW_RATE_APY*100:.0f}% "
+                            f"borrow cost[/yellow]")
+                        continue
+                    if MAX_BREAKEVEN_DAYS > 0 and be > MAX_BREAKEVEN_DAYS:
+                        console.print(
+                            f"[yellow]  Skipping {opp.symbol} {opp.apy:.0f}% APY — "
+                            f"fee break-even {be:.0f}d > limit {MAX_BREAKEVEN_DAYS:.0f}d[/yellow]")
+                        continue
+
+                    console.print(
+                        f"[green]→ {opp.symbol} {opp.apy:.0f}% gross / "
+                        f"[bold]{net:.1f}%[/bold] net APY "
+                        f"({opp.rate_8h*100:+.4f}%/8h)  BE={be:.1f}d  "
+                        f"[dim]size=${eff_size:.0f}[/dim][/green]")
                     try:
                         pos = await open_position(opp, size_usdt=eff_size)
                     except Exception as e:
@@ -1163,7 +1308,7 @@ async def run_farm() -> None:
                         positions.append(pos)
                         monitor.watch(pos.ccxt_symbol, pos.symbol, pos.direction)
                         existing.add(pos.symbol)
-                        # Update margin_usdt estimate (proceeds added from short sell)
+                        # Update budget estimate (proceeds added from short sell)
                         if opp.direction == "long_perp":
                             margin_usdt += pos.notional_usdt
                         else:
@@ -1217,6 +1362,13 @@ async def fetch_spot_data(positions: list[FarmPosition]) -> tuple[float, list[di
                 apy=pos.entry_apy, earned=pos.funding_collected,
                 age_h=(time.time() - pos.entry_ts) / 3600,
                 rate=pos.last_rate, size=pos.size,
+                notional=pos.notional_usdt,
+                net_apy=round(_net_apy(pos.entry_apy), 2),
+                daily_net=round(_daily_net_usdt(pos.notional_usdt, pos.entry_apy), 4),
+                borrow=round(pos.borrow_accrued, 4),
+                entry_fee=round(pos.entry_fee_usdt, 4),
+                net_pnl=round(pos.funding_collected - pos.borrow_accrued - pos.entry_fee_usdt, 4),
+                be_days=round(_breakeven_days(pos.entry_apy), 1),
             ))
         return usdt, rows
     finally:
@@ -1240,8 +1392,15 @@ def show_balance(usdt: float, rows: list[dict]) -> None:
 def generate_dashboard_html(usdt: float, rows: list[dict]) -> str:
     import json as _json
     ts = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    total_earned = sum(r["earned"] for r in rows)
-    total_notional = len(rows) * 500
+    total_earned   = sum(r["earned"]    for r in rows)
+    total_notional = sum(r.get("notional", 500) for r in rows)
+    total_net_pnl  = sum(r.get("net_pnl", 0.0) for r in rows)
+    total_daily    = sum(r.get("daily_net", 0.0) for r in rows)
+    total_borrow   = sum(r.get("borrow", 0.0) for r in rows)
+    weighted_net_apy = (
+        sum(r.get("net_apy", 0) * r.get("notional", 500) for r in rows) / total_notional
+        if total_notional > 0 else 0.0
+    )
 
     rows_json = _json.dumps(rows)
 
@@ -1284,13 +1443,15 @@ def generate_dashboard_html(usdt: float, rows: list[dict]) -> str:
 <div class="cards">
   <div class="card"><div class="cl">USDT Free</div><div class="cv blue">${usdt:,.2f}</div></div>
   <div class="card"><div class="cl">Open Positions</div><div class="cv">{len(rows)}</div></div>
-  <div class="card"><div class="cl">Est. Funding Earned</div><div class="cv green">${total_earned:,.4f}</div></div>
-  <div class="card"><div class="cl">Total Notional</div><div class="cv yellow">${total_notional:,}</div></div>
+  <div class="card"><div class="cl">Total Notional</div><div class="cv yellow">${total_notional:,.0f}</div></div>
+  <div class="card"><div class="cl">Portfolio Net APY</div><div class="cv green">{weighted_net_apy:.1f}%</div></div>
+  <div class="card"><div class="cl">Est. Daily Net $</div><div class="cv green">${total_daily:,.4f}</div></div>
+  <div class="card"><div class="cl">Net P&L</div><div class="cv {'green' if total_net_pnl >= 0 else 'warn'}">${total_net_pnl:,.4f}</div></div>
 </div>
 
 <h2>Perp Positions</h2>
 <table>
-<thead><tr><th>Symbol</th><th>Direction</th><th>Notional</th><th>Age</th><th>Entry APY</th><th>Rate/8h</th><th>Est. Earned</th></tr></thead>
+<thead><tr><th>Symbol</th><th>Direction</th><th>Notional</th><th>Age</th><th>Gross APY</th><th>Net APY</th><th>Daily Net$</th><th>BE Days</th><th>Funding$</th><th>Borrow$</th><th>Net P&L</th><th>Rate/8h</th></tr></thead>
 <tbody id="perp-body"></tbody>
 </table>
 
@@ -1308,18 +1469,27 @@ const sb = document.getElementById("spot-body");
 rows.forEach(function(r) {{
   const dir = r.direction === "short_perp";
   const age = r.age_h >= 24 ? (r.age_h/24).toFixed(1)+"d" : r.age_h.toFixed(1)+"h";
-  const rc  = r.rate >= 0 ? "#4ade80" : "#f87171";
-  const bdg = dir ? "short" : "long";
+  const rc   = r.rate >= 0 ? "#4ade80" : "#f87171";
+  const nc   = (r.net_apy || 0) > 0 ? "#4ade80" : "#f87171";
+  const pnlc = (r.net_pnl || 0) >= 0 ? "#4ade80" : "#f87171";
+  const bdg  = dir ? "short" : "long";
   const dlabel = dir ? "SHORT perp" : "LONG perp";
+  const notional = r.notional ? "$" + r.notional.toFixed(0) : "$?";
+  const beStr = (r.be_days && r.be_days < 999) ? r.be_days.toFixed(1)+"d" : "∞";
   pb.innerHTML +=
     "<tr>" +
     "<td class='sym'>" + r.sym + "</td>" +
     "<td><span class='badge " + bdg + "'>" + dlabel + "</span></td>" +
-    "<td class='mono'>$500</td>" +
+    "<td class='mono'>" + notional + "</td>" +
     "<td class='mono'>" + age + "</td>" +
-    "<td class='mono'>" + r.apy.toFixed(0) + "%</td>" +
-    "<td class='mono pos-rate' style='color:" + rc + "'>" + (r.rate*100).toFixed(4) + "%</td>" +
+    "<td class='mono'>" + r.apy.toFixed(1) + "%</td>" +
+    "<td class='mono' style='color:" + nc + "'>" + (r.net_apy||0).toFixed(1) + "%</td>" +
+    "<td class='mono green'>$" + (r.daily_net||0).toFixed(4) + "</td>" +
+    "<td class='mono'>" + beStr + "</td>" +
     "<td class='mono green'>$" + r.earned.toFixed(4) + "</td>" +
+    "<td class='mono warn'>$" + (r.borrow||0).toFixed(4) + "</td>" +
+    "<td class='mono' style='color:" + pnlc + "'>$" + (r.net_pnl||0).toFixed(4) + "</td>" +
+    "<td class='mono pos-rate' style='color:" + rc + "'>" + (r.rate*100).toFixed(4) + "%</td>" +
     "</tr>";
   const hedgeType = dir ? "Hold tokens" : "Sell tokens short";
   const stCls = r.ok ? "ok" : "warn";
@@ -1327,8 +1497,8 @@ rows.forEach(function(r) {{
   sb.innerHTML +=
     "<tr>" +
     "<td class='sym'>" + r.sym + "</td>" +
-    "<td class='mono'>" + r.balance.toLocaleString() + "</td>" +
-    "<td class='mono'>$" + r.usd.toFixed(2) + "</td>" +
+    "<td class='mono'>" + (r.balance||0).toLocaleString(undefined,{{maximumFractionDigits:2}}) + "</td>" +
+    "<td class='mono'>$" + (r.usd||0).toFixed(2) + "</td>" +
     "<td>" + hedgeType + "</td>" +
     "<td class='mono'>" + r.hedge + "</td>" +
     "<td class='" + stCls + "'>" + stTxt + "</td>" +
