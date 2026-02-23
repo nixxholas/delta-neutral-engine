@@ -334,10 +334,8 @@ async def _open_spot_margin_short(
     """
     base = symbol.split("/")[0]
     mkt  = ex.market(symbol)
-    # Use exchange precision formatter to avoid floating-point string issues
-    step      = float((mkt.get("precision") or {}).get("amount") or 0.001)
-    loan_qty  = math.floor(qty / step) * step
-    loan_qty  = float(ex.amount_to_precision(symbol, loan_qty))
+    step     = _step_from_market(mkt)
+    loan_qty = _quantize(qty, step)   # Decimal-based: prevents 51077/51100 precision errors
 
     # Step 1: borrow the token (cross-margin, no isIsolated needed for cross)
     await _with_retry(
@@ -383,7 +381,7 @@ async def _close_spot_margin_short(
     """
     base = symbol.split("/")[0]
     mkt  = ex.market(symbol)
-    step = float((mkt.get("precision") or {}).get("amount") or 0.001)
+    step = _step_from_market(mkt)
     try:
         # Check current borrowed amount — buy back exactly what we owe
         resp = await ex.sapi_get_margin_asset({"asset": base})
@@ -391,7 +389,8 @@ async def _close_spot_margin_short(
         if borrowed < step * 0.5:
             logger.info("margin_short_already_repaid", symbol=symbol)
             return True
-        buy_qty = math.floor(min(borrowed, stored_size * 1.05) / step) * step
+        # _quantize() prevents 35.800000000000004-style precision errors (error 51077)
+        buy_qty = _quantize(min(borrowed, stored_size * 1.05), step)
 
         # Get current spot price for reference
         ticker = await ex.fetch_ticker(symbol)
@@ -415,15 +414,39 @@ async def _close_spot_margin_short(
         return False
 
 
+# ── Quantity precision helpers ────────────────────────────────────────────────
+
+def _quantize(qty: float, step: float) -> float:
+    """
+    Round qty DOWN to the nearest multiple of step using Decimal arithmetic.
+
+    WHY THIS EXISTS:
+    math.floor(qty / step) * step produces float garbage:
+      35.8 / 0.1 → 358.0 → floor → 358 → * 0.1 → 35.800000000000004  (error 51077)
+    Using Decimal avoids the floating-point multiplication artifact.
+
+    Always call this before submitting any quantity to Binance.
+    """
+    from decimal import Decimal, ROUND_DOWN
+    d_qty  = Decimal(str(qty))
+    d_step = Decimal(str(step))
+    return float((d_qty / d_step).to_integral_value(rounding=ROUND_DOWN) * d_step)
+
+
+def _step_from_market(market: dict) -> float:
+    """Extract the lot-size step from a ccxt market dict."""
+    return float((market.get("precision") or {}).get("amount") or 0.001)
+
+
 # ── Sizing helpers ────────────────────────────────────────────────────────────
 
 def _calc_size(market: dict, mid: float, usdt: float) -> Optional[float]:
     prec    = market.get("precision", {})
     limits  = market.get("limits", {})
-    step    = float(prec.get("amount") or 0.001)
+    step    = _step_from_market(market)
     min_qty = float((limits.get("amount") or {}).get("min") or 0.0)
     max_qty = float((limits.get("amount") or {}).get("max") or float("inf"))
-    size    = math.floor((usdt / mid) / step) * step
+    size    = _quantize(usdt / mid, step)
     size    = max(size, min_qty)
     size    = min(size, max_qty)
     if size <= 0 or size * mid > usdt * 3:
@@ -593,7 +616,7 @@ async def _close_perp_robust(
     """
     mkt      = ex.market(symbol)
     max_qty  = float((mkt.get("limits") or {}).get("amount", {}).get("max") or stored_size)
-    step     = float((mkt.get("precision") or {}).get("amount") or 1.0)
+    step     = _step_from_market(mkt)
 
     # Step 1: fetch actual size — if 0 already, we're done
     actual = await _fetch_actual_perp_size(ex, symbol)
@@ -625,7 +648,7 @@ async def _close_perp_robust(
         mark   = float(ticker.get("last") or ticker.get("close") or ref_mid or 1.0)
         chunk_num = 0
         while remaining > step * 0.5:
-            chunk      = math.floor(min(remaining, max_qty) / step) * step
+            chunk      = _quantize(min(remaining, max_qty), step)
             chunk_num += 1
             placed     = False
             for mult in [0.998, 0.995, 0.990, 0.980, 0.970, 0.950]:
@@ -836,7 +859,7 @@ async def _close_spot_robust(
     """
     base = symbol.split("/")[0]
     mkt  = ex.market(symbol)
-    step = float((mkt.get("precision") or {}).get("amount") or 0.001)
+    step = _step_from_market(mkt)
     try:
         if side == "sell":
             # Selling token back to USDT — use actual balance, not stored
@@ -845,19 +868,18 @@ async def _close_spot_robust(
                 logger.info("spot_close_already_flat", symbol=symbol, side=side)
                 return True
             # Don't over-sell beyond stored_size (guard against stale balance data)
-            sell_qty = math.floor(min(actual, stored_size * 1.02) / step) * step
+            sell_qty = _quantize(min(actual, stored_size * 1.02), step)
             logger.info("spot_close_start", symbol=symbol, side=side,
                         actual_balance=actual, sell_qty=sell_qty)
             await _with_retry(
                 lambda: ex.create_order(symbol, "market", "sell", sell_qty),
                 label=f"close_spot:{symbol}:sell")
         else:
-            # Buying back spot short — use stored_size (USDT denominated)
-            # Re-derive qty from current price
+            # Buying back spot short — re-derive qty from current price
             spot_ticker = await ex.fetch_ticker(symbol)
             spot_mid = (float(spot_ticker.get("last") or 0) or
                         float(spot_ticker.get("close") or 0) or ref_mid or 1.0)
-            buy_qty = math.floor(min(stored_size, stored_size * 1.02) / step) * step
+            buy_qty = _quantize(min(stored_size, stored_size * 1.02), step)
             logger.info("spot_close_start", symbol=symbol, side=side,
                         spot_mid=spot_mid, buy_qty=buy_qty)
             await _with_retry(
@@ -1238,32 +1260,25 @@ async def run_farm() -> None:
             now = time.time()
             if len(positions) < MAX_POSITIONS and (now - last_scan_ts) >= SCAN_INTERVAL_S:
                 console.print(f"\n[cyan]Scanning (min {MIN_ENTRY_APY}% APY)…[/cyan]")
-                opps     = await scan(min_apy=MIN_ENTRY_APY, top_n=200)
-                # Volume floor + blacklist
-                before = len(opps)
-                opps = [o for o in opps
-                        if o.volume_24h_usdt >= MIN_VOLUME_USD
-                        and o.symbol not in BLACKLIST]
-                if len(opps) < before:
-                    console.print(f"[dim]  {before - len(opps)} filtered by volume/blacklist "
-                                  f"(floor=${MIN_VOLUME_USD/1e6:.0f}M)[/dim]")
+                # Scanner handles: perp volume, spot volume, spread, blacklist,
+                # spot market existence, and borrow availability (long_perp).
+                opps = await scan(
+                    min_apy=MIN_ENTRY_APY,
+                    top_n=200,
+                    check_borrow=not SPOT_TESTNET,
+                )
                 existing = {p.symbol for p in positions}
 
-                # Pre-filter: spot market exists + sufficient balance + borrow liquidity
+                # ── Balance check (wallet has enough to open) ──────────────
                 spot_ex_check = _make_spot_exchange()
-                spot_symbols:   set  = set()
-                spot_balances:  dict = {}
-                borrowable_set: set  = set()   # symbols with borrow liquidity (long_perp)
-                margin_usdt = 0.0
+                spot_balances: dict = {}
+                margin_usdt   = 0.0
                 try:
                     await spot_ex_check.load_markets()
-                    spot_symbols = set(spot_ex_check.markets.keys())
                     bal = await spot_ex_check.fetch_balance()
                     spot_balances = {k: float(v.get("free", 0))
                                      for k, v in bal.items()
                                      if isinstance(v, dict)}
-
-                    # Margin USDT for long_perp collateral check
                     if not SPOT_TESTNET:
                         try:
                             resp = await spot_ex_check.sapi_get_margin_account()
@@ -1272,62 +1287,34 @@ async def run_farm() -> None:
                                     margin_usdt = float(a.get("free") or 0)
                         except Exception:
                             pass
-
-                    # Borrow liquidity pre-check for long_perp on mainnet
-                    if not SPOT_TESTNET:
-                        for o in opps:
-                            if o.direction != "long_perp":
-                                borrowable_set.add(o.symbol)
-                                continue
-                            if f"{o.symbol}/USDT" not in spot_symbols:
-                                continue
-                            try:
-                                info  = await spot_ex_check.sapi_get_margin_maxborrowable(
-                                    {"asset": o.symbol})
-                                max_b  = float(info.get("amount") or 0)
-                                needed = POSITION_SIZE_USDT / (o.mid_price or 1.0)
-                                if max_b >= needed:
-                                    borrowable_set.add(o.symbol)
-                                    logger.debug("long_perp_borrow_ok",
-                                                 symbol=o.symbol, max_borrow=round(max_b, 2))
-                                else:
-                                    logger.info("long_perp_borrow_unavailable",
-                                                symbol=o.symbol, max_borrow=round(max_b, 2),
-                                                needed=round(needed, 2))
-                            except Exception as be:
-                                # -3045 or any error = not borrowable right now; skip
-                                logger.info("long_perp_borrow_check_failed",
-                                            symbol=o.symbol, error=str(be)[:80])
-                            await asyncio.sleep(0.05)
-                    else:
-                        borrowable_set = {o.symbol for o in opps}  # testnet: skip check
-
                 except Exception as e:
-                    logger.warning("spot_prefilter_failed", error=str(e)[:100])
-                    borrowable_set = {o.symbol for o in opps}
+                    logger.warning("balance_check_failed", error=str(e)[:100])
                 finally:
                     await spot_ex_check.close()
 
                 spot_usdt = spot_balances.get("USDT", 0.0)
 
                 def _can_execute(opp: FundingOpp) -> bool:
-                    if f"{opp.symbol}/USDT" not in spot_symbols:
-                        return False
-                    if opp.symbol not in borrowable_set:
+                    # Scanner already verified: perp vol, spot vol, spread, borrow
+                    if not opp.borrow_ok:
                         return False
                     if opp.direction == "short_perp":
                         return spot_usdt >= POSITION_SIZE_USDT * 1.05
                     else:
                         if SPOT_TESTNET:
-                            held  = spot_balances.get(opp.symbol, 0.0)
+                            held = spot_balances.get(opp.symbol, 0.0)
                             return held * (opp.mid_price or 1.0) >= POSITION_SIZE_USDT
                         else:
-                            # Need margin USDT as collateral (Binance ~10x margin ratio)
                             return margin_usdt >= POSITION_SIZE_USDT * 0.5
 
                 opps = [o for o in opps if _can_execute(o)]
-                console.print(f"[dim]  {len(opps)} opps pass filter "
-                              f"(spot=${spot_usdt:.0f}, margin=${margin_usdt:.0f})[/dim]")
+                borrow_blocked = sum(1 for o in opps if not o.borrow_ok)
+                console.print(
+                    f"[dim]  {len(opps)} opps executable "
+                    f"(spot=${spot_usdt:.0f}, margin=${margin_usdt:.0f})"
+                    + (f" · {borrow_blocked} blocked by borrow pool" if borrow_blocked else "")
+                    + "[/dim]"
+                )
 
                 # ── APY-weighted sizing ────────────────────────────────────────
                 # Allocate capital proportional to |APY| — highest-returning
