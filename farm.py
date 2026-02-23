@@ -119,15 +119,17 @@ def _daily_net_usdt(notional: float, gross_apy_pct: float) -> float:
 
 def _breakeven_days(gross_apy_pct: float) -> float:
     """
-    Days to recover entry fees at the given net APY.
-    Returns inf if net APY ≤ 0 (never profitable).
+    Days to recover FULL round-trip fees (open + close) at the given net APY.
+    Uses RT_FEE_PCT = 2 × ENTRY_FEE_PCT — position is only profitable if it
+    earns back both the opening AND future closing costs.
+    Returns inf if net APY ≤ 0 (never profitable after borrow cost).
     """
     net = _net_apy(gross_apy_pct) / 100.0
     if net <= 0:
         return float("inf")
-    # entry_fee = ENTRY_FEE_PCT × notional; daily_net = notional × net / 365
-    # breakeven = entry_fee / daily_net = ENTRY_FEE_PCT × 365 / net
-    return (ENTRY_FEE_PCT * 365.0) / net
+    # round_trip_fee = RT_FEE_PCT × notional; daily_net = notional × net / 365
+    # breakeven = RT_FEE_PCT × 365 / net  (notional cancels out)
+    return (RT_FEE_PCT * 365.0) / net
 
 
 def _calc_effective_size(available_usdt: float, free_slots: int) -> float:
@@ -196,6 +198,8 @@ class FarmPosition:
     spot_is_margin:    bool    = False   # True = spot leg used cross-margin (long_perp)
     entry_fee_usdt:    float   = 0.0    # fees paid to open (perp + spot taker)
     borrow_accrued:    float   = 0.0    # cumulative borrow interest (long_perp only)
+    funding_realized:  float   = 0.0    # actual USDT received from Binance FUNDING_FEE income
+    funding_accruing:  float   = 0.0    # estimate of current unsettled period
 
 
 def load_state() -> list[FarmPosition]:
@@ -869,24 +873,81 @@ async def _close_spot_robust(
 # ── Funding refresh ───────────────────────────────────────────────────────────
 
 async def refresh_funding(positions: list[FarmPosition]) -> None:
+    """
+    Refresh per-position funding data:
+    1. Fetch current funding rate for live rate display + exit logic.
+    2. Query actual FUNDING_FEE income from exchange → funding_realized.
+    3. Estimate current unsettled period → funding_accruing.
+    4. funding_collected = funding_realized + funding_accruing (best estimate of total).
+    5. Accrue borrow cost.
+
+    Binance settles funding every 8h (00:00/08:00/16:00 UTC). The rate at
+    settlement is whatever the mark-premium was at that moment — it changes
+    continuously. We track both what has actually settled (realized) and the
+    estimate for the current unsettled period (accruing).
+    """
     if not positions:
         return
     ex = _make_perp_exchange()
+    now = time.time()
     try:
+        # ── Fetch actual settled FUNDING_FEE income ────────────────────────
+        earliest_entry = min(p.entry_ts for p in positions)
+        start_ms = int(earliest_entry * 1000)
+        realized_by_symbol: dict[str, float] = {}
+        try:
+            income_records = await ex.fapiPrivateGetIncome(params={
+                "incomeType": "FUNDING_FEE",
+                "startTime": start_ms,
+                "limit": 1000,
+            })
+            for rec in (income_records or []):
+                # symbol in income records is e.g. "SOLUSDT"
+                raw_sym = rec.get("symbol", "")
+                usdt = float(rec.get("income", 0))
+                realized_by_symbol[raw_sym] = realized_by_symbol.get(raw_sym, 0.0) + usdt
+            logger.debug("funding_income_fetched",
+                         records=len(income_records or []),
+                         symbols=list(realized_by_symbol.keys()))
+        except Exception as e:
+            logger.warning("funding_income_fetch_failed", error=str(e)[:120])
+
+        # ── Per-position update ────────────────────────────────────────────
         for pos in positions:
             try:
                 info = await ex.fetch_funding_rate(pos.ccxt_symbol)
                 rate = float(info.get("fundingRate") or 0)
                 pos.last_rate    = rate
-                pos.last_rate_ts = time.time()
-                # Approximate accrued funding (signed: short_perp earns positive rate)
-                elapsed_8h = (time.time() - pos.entry_ts) / (8 * 3600)
-                sign = 1 if pos.direction == "short_perp" else -1
-                pos.funding_collected = pos.notional_usdt * pos.entry_rate_8h * elapsed_8h * sign
-                # Accrue borrow cost (only for long_perp which has margin short leg)
+                pos.last_rate_ts = now
+
+                # Realized: sum of actual settled payments for this symbol
+                income_sym = pos.symbol + "USDT"   # e.g. "SOLUSDT"
+                pos.funding_realized = realized_by_symbol.get(income_sym, 0.0)
+
+                # Accruing: estimate of current unsettled period.
+                # Binance funding:
+                #   rate > 0 → longs PAY shorts  → short_perp earns
+                #   rate < 0 → shorts PAY longs  → long_perp earns
+                # Formula: earning = notional × rate × earn_sign
+                #   earn_sign = +1 for short_perp (earn when rate>0)
+                #   earn_sign = -1 for long_perp  (earn when rate<0, i.e. -rate>0)
+                elapsed_in_period = (now % (8 * 3600)) / (8 * 3600)   # 0..1
+                earn_sign = 1 if pos.direction == "short_perp" else -1
+                pos.funding_accruing = (
+                    pos.notional_usdt * rate * elapsed_in_period * earn_sign
+                )
+                # Validation:
+                # long_perp,  rate=-0.0004: 197 * (-0.0004) * frac * (-1) = +0.079*frac ✓
+                # short_perp, rate=+0.0004: 197 * (+0.0004) * frac * (+1) = +0.079*frac ✓
+
+                # Best total estimate = realized (actual) + accruing (est)
+                pos.funding_collected = pos.funding_realized + pos.funding_accruing
+
+                # Borrow accrual (long_perp only — we borrow spot for margin short)
                 if pos.spot_is_margin or pos.direction == "long_perp":
-                    elapsed_days = (time.time() - pos.entry_ts) / 86400.0
+                    elapsed_days = (now - pos.entry_ts) / 86400.0
                     pos.borrow_accrued = pos.notional_usdt * BORROW_RATE_APY / 365.0 * elapsed_days
+
             except Exception as e:
                 logger.warning("refresh_funding_error", symbol=pos.symbol, error=str(e))
     finally:
@@ -914,19 +975,24 @@ def show_status(positions: list[FarmPosition]) -> None:
     daily_net_est    = sum(_daily_net_usdt(p.notional_usdt, p.entry_apy) for p in positions)
 
     # ── Per-position table ─────────────────────────────────────────────────────
-    t = Table(title="⚙️  Active Funding Farm Positions")
+    # Next Binance funding settlement (every 8h at 00:00/08:00/16:00 UTC)
+    secs_until_next = 8 * 3600 - (time.time() % (8 * 3600))
+    next_settle_str = f"{int(secs_until_next//3600):01d}h{int((secs_until_next%3600)//60):02d}m"
+
+    t = Table(title=f"⚙️  Active Positions  [dim](next funding settle in {next_settle_str})[/dim]")
     for col, justify, style in [
-        ("Sym",       "left",  "bold"),
-        ("Notional",  "right", ""),
-        ("Gross%",    "right", ""),
-        ("Net%",      "right", ""),
-        ("$/day",     "right", "green"),
-        ("BE",        "right", ""),
-        ("Fund$",     "right", "green"),
-        ("Borrow$",   "right", "dim"),
-        ("Net P&L",   "right", ""),
-        ("Rate/8h",   "right", ""),
-        ("Age",       "right", "dim"),
+        ("Sym",         "left",  "bold"),
+        ("Notional",    "right", ""),
+        ("Gross%",      "right", ""),
+        ("Net%",        "right", ""),
+        ("$/day",       "right", "green"),
+        ("BE(RT)",      "right", ""),      # break-even using round-trip fees
+        ("Realized$",   "right", "green"), # actual settled by exchange
+        ("Accruing$",   "right", "cyan"),  # current period estimate
+        ("Borrow$",     "right", "dim"),
+        ("Net P&L",     "right", ""),
+        ("Rate/8h",     "right", ""),
+        ("Age",         "right", "dim"),
     ]:
         t.add_column(col, justify=justify, style=style)
 
@@ -934,14 +1000,14 @@ def show_status(positions: list[FarmPosition]) -> None:
         age_h     = (time.time() - p.entry_ts) / 3600
         net_apy   = _net_apy(p.entry_apy)
         daily_net = _daily_net_usdt(p.notional_usdt, p.entry_apy)
-        be_days   = _breakeven_days(p.entry_apy)
+        be_days   = _breakeven_days(p.entry_apy)   # now uses RT_FEE_PCT
         net_pnl   = p.funding_collected - p.borrow_accrued - p.entry_fee_usdt
 
-        be_str    = f"{be_days:.1f}d" if be_days < 999 else "∞"
+        be_str        = f"{be_days:.1f}d" if be_days < 999 else "∞"
+        be_color      = "green" if be_days < 7 else ("yellow" if be_days < MAX_BREAKEVEN_DAYS else "red")
         net_apy_color = "green" if net_apy > 0 else "red"
         pnl_color     = "green" if net_pnl >= 0 else "red"
-
-        age_str = f"{age_h/24:.1f}d" if age_h >= 24 else f"{age_h:.1f}h"
+        age_str       = f"{age_h/24:.1f}d" if age_h >= 24 else f"{age_h:.1f}h"
 
         t.add_row(
             p.symbol,
@@ -949,8 +1015,9 @@ def show_status(positions: list[FarmPosition]) -> None:
             f"{p.entry_apy:.1f}%",
             f"[{net_apy_color}]{net_apy:.1f}%[/{net_apy_color}]",
             f"${daily_net:.4f}",
-            be_str,
-            f"${p.funding_collected:.4f}",
+            f"[{be_color}]{be_str}[/{be_color}]",
+            f"${p.funding_realized:.4f}",
+            f"~${p.funding_accruing:.4f}",
             f"${p.borrow_accrued:.4f}",
             f"[{pnl_color}]${net_pnl:.4f}[/{pnl_color}]",
             f"{p.last_rate*100:+.4f}%",
@@ -959,14 +1026,21 @@ def show_status(positions: list[FarmPosition]) -> None:
     _con.print(t)
 
     # ── Portfolio summary line ─────────────────────────────────────────────────
-    net_color = "green" if total_net_pnl >= 0 else "red"
+    net_color    = "green" if total_net_pnl >= 0 else "red"
+    total_realized  = sum(p.funding_realized for p in positions)
+    total_accruing  = sum(p.funding_accruing for p in positions)
     _con.print(
         f"  [dim]Total notional: [/dim][bold]${total_notional:.0f}[/bold]"
         f"  [dim]|  Portfolio net APY: [/dim][bold]{weighted_net_apy:.1f}%[/bold]"
         f"  [dim]|  Est. daily net: [/dim][bold]${daily_net_est:.4f}[/bold]"
         f"  [dim]|  Net P&L: [/dim][{net_color}][bold]${total_net_pnl:.4f}[/bold][/{net_color}]"
-        f"  [dim]  (funding ${total_funding:.4f} − borrow ${total_borrow:.4f}"
-        f" − fees ${total_fees_paid:.4f})[/dim]"
+        f"  [dim]  (realized ${total_realized:.4f} + ~accruing ${total_accruing:.4f}"
+        f" − borrow ${total_borrow:.4f} − open-fees ${total_fees_paid:.4f})[/dim]"
+    )
+    _con.print(
+        f"  [dim]  RT fees (open+close): {RT_FEE_PCT*100:.2f}%  ·  "
+        f"Est. borrow rate: {BORROW_RATE_APY*100:.0f}% APY  ·  "
+        f"Rates reset every 8h — realized only guaranteed at settlement[/dim]"
     )
 
 
