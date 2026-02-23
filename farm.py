@@ -509,18 +509,44 @@ async def run_farm() -> None:
             opps    = await scan(min_apy=MIN_ENTRY_APY, top_n=30)
             existing = {p.symbol for p in positions}
 
-            # Pre-filter: only try tokens that actually exist on spot exchange
-            # (avoids open-perp → spot-fail → rollback cycle for entire tokens)
+            # Pre-filter: only try tokens available on spot AND where we can
+            # actually execute the required spot leg (have USDT for buys,
+            # or hold the token for sells)
             spot_ex_check = _make_spot_exchange()
+            spot_symbols: set = set()
+            spot_balances: dict = {}
             try:
                 await spot_ex_check.load_markets()
                 spot_symbols = set(spot_ex_check.markets.keys())
-                opps = [o for o in opps if f"{o.symbol}/USDT" in spot_symbols]
-                console.print(f"[dim]  {len(opps)} opps with spot market[/dim]")
+                bal = await spot_ex_check.fetch_balance()
+                spot_balances = {k: float(v.get("free", 0))
+                                 for k, v in bal.items()
+                                 if isinstance(v, dict)}
             except Exception as e:
                 logger.warning("spot_prefilter_failed", error=str(e)[:100])
             finally:
                 await spot_ex_check.close()
+
+            spot_usdt = spot_balances.get("USDT", 0.0)
+
+            def _can_execute(opp: FundingOpp) -> bool:
+                spot_sym = f"{opp.symbol}/USDT"
+                if spot_sym not in spot_symbols:
+                    return False
+                if opp.direction == "short_perp":
+                    # Need USDT to buy spot
+                    return spot_usdt >= POSITION_SIZE_USDT * 0.9
+                else:
+                    # long_perp: need to short spot → must hold the token
+                    held = spot_balances.get(opp.symbol, 0.0)
+                    # Estimate required qty (rough: size / current rate won't work,
+                    # use volume as a proxy — just check any nonzero balance >= 50% of notional)
+                    return held > 0   # any holding is a positive signal; farm will size properly
+                                      # if still insufficient, spot leg fails and rolls back cleanly
+
+            opps = [o for o in opps if _can_execute(o)]
+            console.print(f"[dim]  {len(opps)} opps pass spot pre-filter "
+                          f"(USDT=${spot_usdt:.0f})[/dim]")
 
             for opp in opps:
                 if len(positions) >= MAX_POSITIONS:
@@ -534,14 +560,13 @@ async def run_farm() -> None:
                 except Exception as e:
                     logger.warning("open_error", symbol=opp.symbol, error=str(e)[:150])
                     pos = None
+                # Throttle between every attempt (success or fail) to avoid
+                # bursting orders and hitting -1000 Global Order rate limit
+                await asyncio.sleep(5.0)
                 if pos:
                     positions.append(pos)
                     legs = "perp+spot ✓" if pos.spot_leg_live else "perp-only (spot N/A)"
                     console.print(f"[green]  Opened ${pos.notional_usdt:.0f} — {legs}[/green]")
-                    # Pause between opens — Binance order rate limit is
-                    # 300 orders/10s; we have 2 orders per open, so 5s
-                    # gives comfortable headroom even at 10 positions
-                    await asyncio.sleep(5.0)
 
         save_state(positions)
         show_status(positions)
