@@ -33,10 +33,42 @@ from rich.table import Table
 
 from scanner import scan, FundingOpp
 
-load_dotenv()
+_ENV = Path(__file__).parent / ".env"
+load_dotenv(_ENV)
 logger    = structlog.get_logger(__name__)
 console   = Console()
 STATE_FILE = Path("/tmp/funding-farm-state.json")
+
+# ── Retry / rate-limit helpers ─────────────────────────────────────────────────
+
+async def _with_retry(coro_fn, *, label="op", max_attempts=5, base_delay=2.0):
+    """
+    Execute coro_fn() with exponential backoff.
+    Handles Binance 418 (IP ban) and 429 (rate limit exceeded) gracefully.
+    """
+    import ccxt
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await coro_fn()
+        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
+            # 429 → wait rateLimit seconds; 418 → wait longer
+            wait = base_delay * (3 ** (attempt - 1))
+            is_ban = "418" in str(e) or "banned" in str(e).lower()
+            if is_ban:
+                wait = max(wait, 60.0)   # Binance bans last at least 60s
+            logger.warning("rate_limit_backoff", label=label, attempt=attempt,
+                           wait_s=round(wait, 1), ban=is_ban, error=str(e)[:80])
+            if attempt == max_attempts:
+                raise
+            await asyncio.sleep(wait)
+        except ccxt.NetworkError as e:
+            wait = base_delay * (2 ** (attempt - 1))
+            logger.warning("network_error_retry", label=label, attempt=attempt,
+                           wait_s=round(wait, 1), error=str(e)[:80])
+            if attempt == max_attempts:
+                raise
+            await asyncio.sleep(wait)
+    raise RuntimeError(f"{label}: exhausted {max_attempts} retries")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 POSITION_SIZE_USDT = float(os.getenv("FARM_SIZE_USDT",        "500"))
@@ -97,6 +129,7 @@ def _make_perp_exchange():
         "secret": os.getenv("BINANCE_API_SECRET", ""),
         "options": {"defaultType": "future"},
         "enableRateLimit": True,
+        "rateLimit": 100,       # 10 req/s — well under Binance 1200/min weight limit
     })
     if os.getenv("BINANCE_DEMO", "false").lower() == "true":
         test_urls = ex.urls.get("test", {})
@@ -308,8 +341,9 @@ async def _rollback_perp(ex, symbol: str, opened_side: str, size: float, ref_mid
 
 
 async def _open_perp(ex, symbol: str, side: str, size: float):
-    order = await ex.create_order(symbol, "market", side, size,
-                                  params={"reduceOnly": False})
+    order = await _with_retry(
+        lambda: ex.create_order(symbol, "market", side, size, params={"reduceOnly": False}),
+        label=f"open_perp:{symbol}:{side}")
     fill  = float(order.get("average") or order.get("price") or 0)
     return str(order["id"]), fill
 
@@ -334,9 +368,13 @@ async def _open_spot(ex, symbol: str, side: str, perp_size: float, perp_mid: flo
         if not adj:
             raise ValueError(f"invalid spot size for {symbol} "
                              f"(spot_mid={spot_mid}, target=${target_usdt:.2f})")
-        order = await ex.create_order(symbol, "market", side, adj)
+        order = await _with_retry(
+            lambda: ex.create_order(symbol, "market", side, adj),
+            label=f"open_spot:{symbol}:{side}")
         fill  = float(order.get("average") or order.get("price") or spot_mid)
         return str(order["id"]), fill
+    except RuntimeError:
+        raise
     except Exception as e:
         raise RuntimeError(f"spot open failed: {e}") from e
 
@@ -370,16 +408,19 @@ async def close_position(pos: FarmPosition) -> bool:
 
 
 async def _close_perp(ex, symbol, side, size):
-    order = await ex.create_order(symbol, "market", side, size,
-                                  params={"reduceOnly": True})
+    order = await _with_retry(
+        lambda: ex.create_order(symbol, "market", side, size, params={"reduceOnly": True}),
+        label=f"close_perp:{symbol}:{side}")
     return order
 
 
 async def _close_spot(ex, symbol, side, size):
     try:
         mkt = ex.market(symbol)
-        adj = _calc_size(mkt, 1.0, size) or size  # rough; market order anyway
-        order = await ex.create_order(symbol, "market", side, size)
+        adj = _calc_size(mkt, 1.0, size) or size
+        order = await _with_retry(
+            lambda: ex.create_order(symbol, "market", side, size),
+            label=f"close_spot:{symbol}:{side}")
         return order
     except Exception as e:
         raise RuntimeError(f"spot close failed: {e}") from e
@@ -485,6 +526,8 @@ async def run_farm() -> None:
                     positions.append(pos)
                     legs = "perp+spot ✓" if pos.spot_leg_live else "perp-only (spot N/A)"
                     console.print(f"[green]  Opened ${pos.notional_usdt:.0f} — {legs}[/green]")
+                    # Small pause between opens to stay well under rate limits
+                    await asyncio.sleep(2.0)
 
         save_state(positions)
         show_status(positions)
