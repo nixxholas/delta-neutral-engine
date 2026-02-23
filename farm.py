@@ -44,31 +44,43 @@ STATE_FILE = Path("/tmp/funding-farm-state.json")
 async def _with_retry(coro_fn, *, label="op", max_attempts=5, base_delay=2.0):
     """
     Execute coro_fn() with exponential backoff.
-    Handles Binance 418 (IP ban) and 429 (rate limit exceeded) gracefully.
+    Handles Binance rate limits (418 IP ban, 429, -1000/-1003/-1015 order limits).
     """
     import ccxt
+
+    _RATE_ERRS = (ccxt.RateLimitExceeded, ccxt.DDoSProtection)
+
+    def _is_rate_limited(e: Exception) -> bool:
+        if isinstance(e, _RATE_ERRS):
+            return True
+        msg = str(e).lower()
+        # Binance -1000 "Global Order rate limitation exceeded"
+        # Binance -1015 "Too many new orders"
+        # Binance -1003 "Way too many requests"
+        return any(x in msg for x in [
+            "rate limit", "rate limitation", "too many orders",
+            "too many requests", "global order", "-1000", "-1003", "-1015",
+        ])
+
+    def _is_ban(e: Exception) -> bool:
+        msg = str(e).lower()
+        return "418" in str(e) or "banned" in msg or "ip banned" in msg
+
     for attempt in range(1, max_attempts + 1):
         try:
             return await coro_fn()
-        except (ccxt.RateLimitExceeded, ccxt.DDoSProtection) as e:
-            # 429 → wait rateLimit seconds; 418 → wait longer
-            wait = base_delay * (3 ** (attempt - 1))
-            is_ban = "418" in str(e) or "banned" in str(e).lower()
-            if is_ban:
-                wait = max(wait, 60.0)   # Binance bans last at least 60s
-            logger.warning("rate_limit_backoff", label=label, attempt=attempt,
-                           wait_s=round(wait, 1), ban=is_ban, error=str(e)[:80])
-            if attempt == max_attempts:
-                raise
-            await asyncio.sleep(wait)
-        except ccxt.NetworkError as e:
+        except Exception as e:
+            if not (_is_rate_limited(e) or isinstance(e, ccxt.NetworkError)):
+                raise   # non-retriable — bubble up immediately
+
             wait = base_delay * (2 ** (attempt - 1))
-            logger.warning("network_error_retry", label=label, attempt=attempt,
-                           wait_s=round(wait, 1), error=str(e)[:80])
+            if _is_ban(e):
+                wait = max(wait, 60.0)   # Binance IP bans last ≥ 60s
+            logger.warning("retry_backoff", label=label, attempt=attempt,
+                           wait_s=round(wait, 1), ban=_is_ban(e), error=str(e)[:100])
             if attempt == max_attempts:
                 raise
             await asyncio.sleep(wait)
-    raise RuntimeError(f"{label}: exhausted {max_attempts} retries")
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 POSITION_SIZE_USDT = float(os.getenv("FARM_SIZE_USDT",        "500"))
@@ -526,8 +538,10 @@ async def run_farm() -> None:
                     positions.append(pos)
                     legs = "perp+spot ✓" if pos.spot_leg_live else "perp-only (spot N/A)"
                     console.print(f"[green]  Opened ${pos.notional_usdt:.0f} — {legs}[/green]")
-                    # Small pause between opens to stay well under rate limits
-                    await asyncio.sleep(2.0)
+                    # Pause between opens — Binance order rate limit is
+                    # 300 orders/10s; we have 2 orders per open, so 5s
+                    # gives comfortable headroom even at 10 positions
+                    await asyncio.sleep(5.0)
 
         save_state(positions)
         show_status(positions)
