@@ -570,11 +570,16 @@ async def run_farm() -> None:
                     if f"{opp.symbol}/USDT" not in spot_symbols:
                         return False
                     if opp.direction == "short_perp":
-                        return spot_usdt >= POSITION_SIZE_USDT * 0.9
+                        # Need USDT to buy spot — require 105% headroom for slippage
+                        return spot_usdt >= POSITION_SIZE_USDT * 1.05
                     else:
+                        # long_perp: short spot → need to hold enough of the token
                         held      = spot_balances.get(opp.symbol, 0.0)
-                        held_usdt = held * (opp.mid_price or 1.0)
-                        return held_usdt >= POSITION_SIZE_USDT * 0.9
+                        price     = opp.mid_price or 1.0
+                        held_usdt = held * price
+                        # Require 110% headroom — price may move between pre-filter
+                        # and order execution; avoids "insufficient balance" failures
+                        return held_usdt >= POSITION_SIZE_USDT * 1.10
 
                 opps = [o for o in opps if _can_execute(o)]
                 console.print(f"[dim]  {len(opps)} opps pass spot pre-filter "
