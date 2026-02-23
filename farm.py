@@ -162,7 +162,7 @@ def _apy_weighted_sizes(budget: float, opps: list) -> list:
         size   = max(POSITION_SIZE_USDT, ideal)
         if MAX_POSITION_SIZE > 0:
             size = min(MAX_POSITION_SIZE, size)
-        result.append((o, math.floor(size)))
+        result.append((o.symbol, math.floor(size)))
     return result
 
 # Spot exchange credentials (defaults to same keys as futures — works on mainnet)
@@ -414,6 +414,95 @@ async def _close_spot_margin_short(
         return False
 
 
+async def _open_spot_margin_long(
+    ex,           # margin exchange (defaultType=margin)
+    symbol: str,  # e.g. "ADA/USDT"
+    qty: float,
+    ref_mid: float,
+) -> tuple[str, float]:
+    """
+    Borrow USDT from cross-margin and buy base asset (margin long).
+    Used for short_perp direction: short perp + long spot = delta neutral.
+    At close: sell token via margin + AUTO_REPAY to settle USDT borrow.
+    Returns (order_id, fill_price).
+    """
+    mkt  = ex.market(symbol)
+    step = _step_from_market(mkt)
+    buy_qty = _quantize(qty, step)
+    # Add 1.5% buffer on USDT borrow to cover spread + price movement
+    usdt_borrow = round(buy_qty * ref_mid * 1.015, 4)
+
+    # Step 1: borrow USDT from cross-margin pool
+    await _with_retry(
+        lambda: ex.sapi_post_margin_loan({"asset": "USDT", "amount": str(usdt_borrow)}),
+        label=f"margin_borrow_usdt:{symbol}")
+    logger.info("margin_borrowed_usdt", symbol=symbol, usdt=usdt_borrow)
+
+    # Step 2: buy via cross-margin SAPI endpoint
+    binance_sym = symbol.replace("/", "")
+    try:
+        order = await _with_retry(
+            lambda: ex.sapi_post_margin_order({
+                "symbol":   binance_sym,
+                "side":     "BUY",
+                "type":     "MARKET",
+                "quantity": str(buy_qty),
+            }),
+            label=f"margin_buy:{symbol}")
+    except Exception as e:
+        logger.error("margin_buy_failed_repaying_usdt", symbol=symbol, error=str(e)[:140])
+        await _repay_margin_loan(ex, "USDT", usdt_borrow)
+        raise
+
+    fills  = order.get("fills") or []
+    fill   = (sum(float(f["price"]) * float(f["qty"]) for f in fills) /
+              sum(float(f["qty"]) for f in fills)) if fills else float(
+              order.get("price") or ref_mid)
+    logger.info("margin_bought", symbol=symbol, qty=buy_qty, fill=fill,
+                order_id=order.get("orderId"))
+    return str(order.get("orderId", "")), fill
+
+
+async def _close_spot_margin_long(
+    ex,
+    symbol: str,
+    stored_size: float,
+    ref_mid: float,
+) -> bool:
+    """
+    Sell margin-long spot position and auto-repay USDT borrow.
+    Used for short_perp + spot_is_margin close.
+    """
+    base = symbol.split("/")[0]
+    mkt  = ex.market(symbol)
+    step = _step_from_market(mkt)
+    try:
+        # Check current free balance of the token in cross-margin
+        resp = await ex.sapi_get_margin_asset({"asset": base})
+        free_bal = float(resp.get("free") or 0)
+        if free_bal < step * 0.5:
+            logger.info("margin_long_already_sold", symbol=symbol)
+            return True
+        sell_qty = _quantize(min(free_bal, stored_size * 1.05), step)
+
+        binance_sym = symbol.replace("/", "")
+        order = await _with_retry(
+            lambda: ex.sapi_post_margin_order({
+                "symbol":         binance_sym,
+                "side":           "SELL",
+                "type":           "MARKET",
+                "quantity":       str(sell_qty),
+                "sideEffectType": "AUTO_REPAY",  # sells token → receives USDT → repays USDT borrow
+            }),
+            label=f"margin_long_sell:{symbol}")
+        logger.info("margin_long_sold", symbol=symbol, qty=sell_qty,
+                    fill=order.get("average") or ref_mid)
+        return True
+    except Exception as e:
+        logger.error("margin_long_close_failed", symbol=symbol, error=str(e)[:200])
+        return False
+
+
 # ── Quantity precision helpers ────────────────────────────────────────────────
 
 def _quantize(qty: float, step: float) -> float:
@@ -469,7 +558,8 @@ async def _get_mid(ex, symbol: str) -> Optional[float]:
 
 # ── Open both legs ────────────────────────────────────────────────────────────
 
-async def open_position(opp: FundingOpp, size_usdt: Optional[float] = None) -> Optional[FarmPosition]:
+async def open_position(opp: FundingOpp, size_usdt: Optional[float] = None,
+                        use_margin_spot: bool = False) -> Optional[FarmPosition]:
     """Open perp + spot legs simultaneously (asyncio.gather)."""
     spot_symbol = opp.symbol + "/USDT"
 
@@ -511,11 +601,15 @@ async def open_position(opp: FundingOpp, size_usdt: Optional[float] = None) -> O
                                 "Set BINANCE_SPOT_API_KEY in .env to enable.")
             return None
 
-        use_margin = (opp.direction == "long_perp") and not SPOT_TESTNET
+        use_margin_short = (opp.direction == "long_perp") and not SPOT_TESTNET
+        use_margin_long  = (opp.direction == "short_perp") and use_margin_spot and not SPOT_TESTNET
+        spot_mode = ("cross_margin_short" if use_margin_short
+                     else "cross_margin_long" if use_margin_long
+                     else "spot")
         logger.info("opening_both_legs", symbol=opp.symbol,
                     perp_side=perp_side, spot_side=spot_side,
                     size=perp_size, mid=mid, apy=round(opp.apy, 1),
-                    spot_mode="cross_margin" if use_margin else "spot")
+                    spot_mode=spot_mode)
 
         # Open perp first, then spot. If spot fails, roll back perp.
         try:
@@ -529,11 +623,22 @@ async def open_position(opp: FundingOpp, size_usdt: Optional[float] = None) -> O
         spot_live    = False
         spot_margin  = False
         try:
-            if use_margin:
+            if use_margin_short:
+                # long_perp: borrow token → sell it short
                 margin_ex = _make_margin_exchange()
                 try:
                     await margin_ex.load_markets()
                     spot_id, spot_fill = await _open_spot_margin_short(
+                        margin_ex, spot_symbol, perp_size, mid)
+                    spot_margin = True
+                finally:
+                    await margin_ex.close()
+            elif use_margin_long:
+                # short_perp via margin: borrow USDT → buy token
+                margin_ex = _make_margin_exchange()
+                try:
+                    await margin_ex.load_markets()
+                    spot_id, spot_fill = await _open_spot_margin_long(
                         margin_ex, spot_symbol, perp_size, mid)
                     spot_margin = True
                 finally:
@@ -571,7 +676,9 @@ async def open_position(opp: FundingOpp, size_usdt: Optional[float] = None) -> O
             entry_fee_usdt   = round(_notional * _fee_pct, 6),
         )
 
-        legs = ("perp+margin_short" if spot_margin
+        margin_mode = (f"margin_{'short' if opp.direction == 'long_perp' else 'long'}"
+                       if spot_margin else None)
+        legs = (f"perp+{margin_mode}" if spot_margin
                 else "perp+spot" if spot_live
                 else "perp-only (spot failed)")
         logger.info("position_opened", symbol=opp.symbol, legs=legs,
@@ -775,15 +882,22 @@ async def close_position(pos: FarmPosition) -> bool:
         # ── Spot leg ──────────────────────────────────────────────────────────
         if pos.spot_leg_live and not pos.spot_closed:
             if pos.spot_is_margin:
-                # long_perp: buy back borrowed token + auto-repay margin loan
+                # Margin-based spot close — direction determines which function:
+                #   long_perp  → buy back borrowed token + auto-repay token loan
+                #   short_perp → sell held token + auto-repay USDT loan
                 margin_ex = _make_margin_exchange()
                 try:
                     await margin_ex.load_markets()
                     ticker_spot = await margin_ex.fetch_ticker(pos.spot_symbol)
                     ref_spot = (float(ticker_spot.get("last") or 0) or
                                 float(ticker_spot.get("close") or 0) or pos.spot_entry_price)
-                    spot_ok = await _close_spot_margin_short(
-                        margin_ex, pos.spot_symbol, pos.size, ref_spot)
+                    if pos.direction == "long_perp":
+                        spot_ok = await _close_spot_margin_short(
+                            margin_ex, pos.spot_symbol, pos.size, ref_spot)
+                    else:
+                        # short_perp with margin USDT borrow
+                        spot_ok = await _close_spot_margin_long(
+                            margin_ex, pos.spot_symbol, pos.size, ref_spot)
                 except Exception as e:
                     logger.error("margin_close_exception", symbol=pos.symbol, error=str(e)[:200])
                     spot_ok = False
@@ -993,9 +1107,10 @@ def show_status(positions: list[FarmPosition]) -> None:
 
     # Portfolio metrics use LIVE rates (not entry rates) — shows actual current exposure
     def _live_net_apy(p: FarmPosition) -> float:
-        earn_sign = 1 if p.direction == "short_perp" else -1
-        live_apy  = p.last_rate * earn_sign * 3 * 365 * 100
-        return live_apy - (BORROW_RATE_APY * 100)
+        earn_sign  = 1 if p.direction == "short_perp" else -1
+        live_apy   = p.last_rate * earn_sign * 3 * 365 * 100
+        has_borrow = p.direction == "long_perp" or p.spot_is_margin
+        return live_apy - (BORROW_RATE_APY * 100 if has_borrow else 0)
 
     weighted_net_apy = (
         sum(p.notional_usdt * _live_net_apy(p) for p in positions) / total_notional
@@ -1033,10 +1148,11 @@ def show_status(positions: list[FarmPosition]) -> None:
 
         # Live earning APY: the rate we're ACTUALLY on right now
         # long_perp earns when rate < 0; effective = -rate * annualisation
-        earn_sign  = 1 if p.direction == "short_perp" else -1
-        live_apy   = p.last_rate * earn_sign * 3 * 365 * 100   # signed: positive = earning
-        live_net   = live_apy - (BORROW_RATE_APY * 100)
-        daily_net  = p.notional_usdt * live_net / 100.0 / 365.0
+        earn_sign   = 1 if p.direction == "short_perp" else -1
+        live_apy    = p.last_rate * earn_sign * 3 * 365 * 100   # signed: positive = earning
+        _has_borrow = p.direction == "long_perp" or p.spot_is_margin
+        live_net    = live_apy - (BORROW_RATE_APY * 100 if _has_borrow else 0)
+        daily_net   = p.notional_usdt * live_net / 100.0 / 365.0
 
         be_days    = _breakeven_days(live_apy)   # based on LIVE rate, not entry
         net_pnl    = p.funding_collected - p.borrow_accrued - p.entry_fee_usdt
@@ -1162,7 +1278,19 @@ async def _reconcile_on_startup(tracked: list) -> None:
     # Repay any dangling loans not covered by active tracked positions.
     # Arises from failed open attempts where borrow succeeded but sell failed.
     if not SPOT_TESTNET:
-        active_borrows = {p.symbol for p in tracked if p.spot_is_margin and p.spot_leg_live}
+        # Build set of actively-borrowed assets (skip during cleanup):
+        #   long_perp  → borrowed the token itself (e.g. "SOL")
+        #   short_perp + spot_is_margin → borrowed "USDT"
+        active_borrows: set[str] = set()
+        has_active_usdt_borrow = False
+        for p in tracked:
+            if p.spot_is_margin and p.spot_leg_live:
+                if p.direction == "long_perp":
+                    active_borrows.add(p.symbol)
+                else:
+                    has_active_usdt_borrow = True
+        if has_active_usdt_borrow:
+            active_borrows.add("USDT")
         spot = _make_spot_exchange()
         try:
             await spot.load_markets()
@@ -1316,7 +1444,11 @@ async def run_farm() -> None:
                     if not opp.borrow_ok:
                         return False
                     if opp.direction == "short_perp":
-                        return spot_usdt >= POSITION_SIZE_USDT * 1.05
+                        # Prefer direct spot USDT; fall back to cross-margin USDT borrow
+                        if spot_usdt >= POSITION_SIZE_USDT * 1.05:
+                            return True
+                        # Margin long: borrow USDT → buy token (uses cross-margin leverage)
+                        return (not SPOT_TESTNET) and margin_usdt >= POSITION_SIZE_USDT * 1.05
                     else:
                         if SPOT_TESTNET:
                             held = spot_balances.get(opp.symbol, 0.0)
@@ -1339,12 +1471,18 @@ async def run_farm() -> None:
                 new_opps = [o for o in opps if o.symbol not in existing
                             and len(positions) < MAX_POSITIONS]
                 if new_opps:
-                    # Separate by leg type (separate budgets)
-                    lp_opps = [o for o in new_opps if o.direction == "long_perp"]
-                    sp_opps = [o for o in new_opps if o.direction == "short_perp"]
-                    lp_sizes = dict(_apy_weighted_sizes(margin_usdt, lp_opps))
-                    sp_sizes = dict(_apy_weighted_sizes(spot_usdt,   sp_opps))
-                    opp_sizes = {**lp_sizes, **sp_sizes}
+                    # long_perp always uses margin; short_perp uses spot USDT if available,
+                    # otherwise falls back to cross-margin USDT borrow.
+                    sp_spot_opps   = [o for o in new_opps if o.direction == "short_perp"
+                                      and spot_usdt >= POSITION_SIZE_USDT * 1.05]
+                    sp_margin_opps = [o for o in new_opps if o.direction == "short_perp"
+                                      and spot_usdt < POSITION_SIZE_USDT * 1.05]
+                    lp_opps        = [o for o in new_opps if o.direction == "long_perp"]
+                    # margin budget is shared across long_perp and margin-backed short_perp
+                    all_margin_opps = lp_opps + sp_margin_opps
+                    margin_sizes = dict(_apy_weighted_sizes(margin_usdt, all_margin_opps))
+                    spot_sizes   = dict(_apy_weighted_sizes(spot_usdt,   sp_spot_opps))
+                    opp_sizes    = {**margin_sizes, **spot_sizes}
                 else:
                     opp_sizes = {}
 
@@ -1354,11 +1492,26 @@ async def run_farm() -> None:
                     if opp.symbol in existing:
                         continue
 
-                    eff_size = opp_sizes.get(opp, POSITION_SIZE_USDT)
+                    eff_size = opp_sizes.get(opp.symbol, POSITION_SIZE_USDT)
 
                     # ── Min viable check: reject if net APY ≤ 0 ──────────────
-                    net = _net_apy(opp.apy)
-                    be  = _breakeven_days(opp.apy)
+                    # Determine if this will use a margin borrow (costs borrow rate):
+                    #   long_perp:          always borrows the token
+                    #   short_perp via margin: borrows USDT (when spot_usdt insufficient)
+                    #   short_perp via spot:  no borrow cost
+                    _use_margin_spot = (
+                        opp.direction == "short_perp"
+                        and spot_usdt < eff_size * 1.05
+                        and not SPOT_TESTNET
+                    )
+                    _has_borrow_cost = (opp.direction == "long_perp") or _use_margin_spot
+                    if _has_borrow_cost:
+                        net = _net_apy(opp.apy)      # deducts borrow rate
+                        be  = _breakeven_days(opp.apy)
+                    else:
+                        # short_perp via spot USDT: no borrow, net = gross APY
+                        net = abs(opp.apy)
+                        be  = (RT_FEE_PCT * 365.0) / (net / 100.0) if net > 0 else float("inf")
                     if net <= 0:
                         console.print(
                             f"[yellow]  Skipping {opp.symbol} {opp.apy:.0f}% APY — "
@@ -1371,13 +1524,15 @@ async def run_farm() -> None:
                             f"fee break-even {be:.0f}d > limit {MAX_BREAKEVEN_DAYS:.0f}d[/yellow]")
                         continue
 
+                    borrow_note = f" (incl {BORROW_RATE_APY*100:.0f}% borrow)" if _has_borrow_cost else ""
                     console.print(
                         f"[green]→ {opp.symbol} {opp.apy:.0f}% gross / "
-                        f"[bold]{net:.1f}%[/bold] net APY "
+                        f"[bold]{net:.1f}%[/bold] net APY{borrow_note} "
                         f"({opp.rate_8h*100:+.4f}%/8h)  BE={be:.1f}d  "
                         f"[dim]size=${eff_size:.0f}[/dim][/green]")
                     try:
-                        pos = await open_position(opp, size_usdt=eff_size)
+                        pos = await open_position(opp, size_usdt=eff_size,
+                                                  use_margin_spot=_use_margin_spot)
                     except Exception as e:
                         logger.warning("open_error", symbol=opp.symbol, error=str(e)[:150])
                         pos = None
@@ -1386,9 +1541,13 @@ async def run_farm() -> None:
                         positions.append(pos)
                         monitor.watch(pos.ccxt_symbol, pos.symbol, pos.direction)
                         existing.add(pos.symbol)
-                        # Update budget estimate (proceeds added from short sell)
+                        # Update budget estimate
                         if opp.direction == "long_perp":
+                            # Borrow proceeds land back in cross-margin as USDT
                             margin_usdt += pos.notional_usdt
+                        elif _use_margin_spot:
+                            # Borrowed USDT from margin — reduce available margin
+                            margin_usdt -= pos.notional_usdt
                         else:
                             spot_usdt   -= pos.notional_usdt
                         legs = "perp+spot ✓" if pos.spot_leg_live else "perp-only"
