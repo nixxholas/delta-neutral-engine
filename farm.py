@@ -88,6 +88,9 @@ MIN_ENTRY_APY      = float(os.getenv("FARM_MIN_ENTRY_APY",    "15"))
 EXIT_APY_THRESHOLD = float(os.getenv("FARM_EXIT_APY",         "5"))
 SCAN_INTERVAL_S    = int(  os.getenv("FARM_SCAN_INTERVAL",    "1800"))
 MAX_POSITIONS      = int(  os.getenv("FARM_MAX_POSITIONS",    "3"))
+MIN_VOLUME_USD     = float(os.getenv("FARM_MIN_VOLUME_USD",   "0"))
+BLACKLIST: set     = {s.strip().upper()
+                      for s in os.getenv("FARM_BLACKLIST", "").split(",") if s.strip()}
 
 # Spot exchange credentials (defaults to same keys as futures — works on mainnet)
 SPOT_API_KEY    = os.getenv("BINANCE_SPOT_API_KEY")    or os.getenv("BINANCE_API_KEY",    "")
@@ -119,6 +122,7 @@ class FarmPosition:
     needs_close:       bool    = False   # True = must close regardless of current rate
     perp_closed:       bool    = False   # True = perp leg confirmed closed
     spot_closed:       bool    = False   # True = spot leg confirmed closed
+    spot_is_margin:    bool    = False   # True = spot leg used cross-margin (long_perp)
 
 
 def load_state() -> list[FarmPosition]:
@@ -189,6 +193,116 @@ def _make_spot_exchange():
     if SPOT_TESTNET:
         ex.set_sandbox_mode(True)
     return ex
+
+
+def _make_margin_exchange():
+    """Cross-margin exchange for long_perp spot leg (borrow+sell / buy+repay)."""
+    import ccxt.async_support as ccxt
+    key_path = (os.getenv("BINANCE_SPOT_PRIVATE_KEY_PATH", "") or
+                os.getenv("BINANCE_PRIVATE_KEY_PATH", ""))
+    config: dict = {
+        "apiKey": SPOT_API_KEY,
+        "options": {"defaultType": "margin"},
+        "enableRateLimit": True,
+    }
+    if key_path and os.path.exists(key_path):
+        with open(key_path) as f:
+            config["secret"] = f.read()
+    else:
+        config["secret"] = SPOT_API_SECRET
+    ex = ccxt.binance(config)
+    if SPOT_TESTNET:
+        ex.set_sandbox_mode(True)
+    return ex
+
+
+async def _fetch_margin_usdt() -> float:
+    """Return free USDT in cross-margin wallet."""
+    ex = _make_spot_exchange()
+    try:
+        await ex.load_markets()
+        resp = await ex.sapi_get_margin_account()
+        for asset in resp.get("userAssets", []):
+            if asset["asset"] == "USDT":
+                return float(asset.get("free") or 0)
+        return 0.0
+    except Exception as e:
+        logger.warning("fetch_margin_usdt_failed", error=str(e)[:120])
+        return 0.0
+    finally:
+        await ex.close()
+
+
+async def _open_spot_margin_short(
+    ex,           # margin exchange (defaultType=margin)
+    symbol: str,  # e.g. "LA/USDT"
+    qty: float,
+    ref_mid: float,
+) -> tuple[str, float]:
+    """
+    Borrow base asset from cross-margin pool and sell it (short-sell).
+    Used for long_perp direction: long perp + short spot = delta neutral.
+    Returns (order_id, fill_price).
+    """
+    base = symbol.split("/")[0]
+    mkt  = ex.market(symbol)
+    step = float((mkt.get("precision") or {}).get("amount") or 0.001)
+    loan_qty = math.floor(qty / step) * step
+
+    # Step 1: borrow the token
+    await _with_retry(
+        lambda: ex.sapi_post_margin_loan({
+            "asset": base, "amount": str(loan_qty), "isIsolated": "FALSE"
+        }),
+        label=f"margin_borrow:{symbol}")
+    logger.info("margin_borrowed", symbol=symbol, qty=loan_qty)
+
+    # Step 2: sell it via margin account
+    order = await _with_retry(
+        lambda: ex.create_order(symbol, "market", "sell", loan_qty,
+                                params={"isIsolated": "FALSE"}),
+        label=f"margin_sell:{symbol}")
+    fill = float(order.get("average") or order.get("price") or ref_mid)
+    logger.info("margin_sold", symbol=symbol, qty=loan_qty, fill=fill)
+    return str(order["id"]), fill
+
+
+async def _close_spot_margin_short(
+    ex,
+    symbol: str,
+    stored_size: float,
+    ref_mid: float,
+) -> bool:
+    """
+    Buy back borrowed base asset and auto-repay cross-margin loan.
+    """
+    base = symbol.split("/")[0]
+    mkt  = ex.market(symbol)
+    step = float((mkt.get("precision") or {}).get("amount") or 0.001)
+    try:
+        # Check current borrowed amount — buy back exactly what we owe
+        resp = await ex.sapi_get_margin_asset({"asset": base})
+        borrowed = float(resp.get("borrowed") or resp.get("netAsset") or stored_size)
+        if borrowed < step * 0.5:
+            logger.info("margin_short_already_repaid", symbol=symbol)
+            return True
+        buy_qty = math.floor(min(borrowed, stored_size * 1.05) / step) * step
+
+        # Get current spot price for reference
+        ticker = await ex.fetch_ticker(symbol)
+        ref = float(ticker.get("last") or ticker.get("close") or ref_mid)
+
+        order = await _with_retry(
+            lambda: ex.create_order(symbol, "market", "buy", buy_qty,
+                                    params={"sideEffectType": "AUTO_REPAY",
+                                            "isIsolated": "FALSE"}),
+            label=f"margin_repay:{symbol}")
+        logger.info("margin_repaid", symbol=symbol, qty=buy_qty,
+                    fill=order.get("average") or ref)
+        return True
+    except Exception as e:
+        logger.error("margin_close_failed", symbol=symbol, error=str(e)[:200])
+        return False
 
 
 # ── Sizing helpers ────────────────────────────────────────────────────────────
@@ -262,9 +376,11 @@ async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
                                 "Set BINANCE_SPOT_API_KEY in .env to enable.")
             return None
 
+        use_margin = (opp.direction == "long_perp") and not SPOT_TESTNET
         logger.info("opening_both_legs", symbol=opp.symbol,
                     perp_side=perp_side, spot_side=spot_side,
-                    size=perp_size, mid=mid, apy=round(opp.apy, 1))
+                    size=perp_size, mid=mid, apy=round(opp.apy, 1),
+                    spot_mode="cross_margin" if use_margin else "spot")
 
         # Open perp first, then spot. If spot fails, roll back perp.
         try:
@@ -273,12 +389,23 @@ async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
             logger.error("perp_leg_failed", symbol=opp.symbol, error=str(e)[:200])
             return None
 
-        spot_id   = ""
-        spot_fill = mid
-        spot_live = False
+        spot_id      = ""
+        spot_fill    = mid
+        spot_live    = False
+        spot_margin  = False
         try:
-            spot_id, spot_fill = await _open_spot(
-                spot_ex, spot_symbol, spot_side, perp_size, mid)
+            if use_margin:
+                margin_ex = _make_margin_exchange()
+                try:
+                    await margin_ex.load_markets()
+                    spot_id, spot_fill = await _open_spot_margin_short(
+                        margin_ex, spot_symbol, perp_size, mid)
+                    spot_margin = True
+                finally:
+                    await margin_ex.close()
+            else:
+                spot_id, spot_fill = await _open_spot(
+                    spot_ex, spot_symbol, spot_side, perp_size, mid)
             spot_live = True
         except Exception as e:
             logger.error("spot_leg_failed_rolling_back_perp",
@@ -301,11 +428,14 @@ async def open_position(opp: FundingOpp) -> Optional[FarmPosition]:
             entry_apy        = opp.apy,
             entry_ts         = time.time(),
             spot_leg_live    = spot_live,
+            spot_is_margin   = spot_margin,
             last_rate        = opp.rate_8h,
             last_rate_ts     = time.time(),
         )
 
-        legs = "perp+spot" if spot_live else "perp-only (spot failed)"
+        legs = ("perp+margin_short" if spot_margin
+                else "perp+spot" if spot_live
+                else "perp-only (spot failed)")
         logger.info("position_opened", symbol=opp.symbol, legs=legs,
                     notional=round(perp_size * perp_fill, 2), apy=round(opp.apy, 1))
         return pos
@@ -506,34 +636,50 @@ async def close_position(pos: FarmPosition) -> bool:
 
         # ── Spot leg ──────────────────────────────────────────────────────────
         if pos.spot_leg_live and not pos.spot_closed:
-            spot_markets_ok = False
-            try:
-                await spot_ex.load_markets()
-                spot_markets_ok = True
-            except Exception as e:
-                logger.error("spot_markets_unavailable_on_close", symbol=pos.symbol,
-                             error=str(e)[:120])
+            if pos.spot_is_margin:
+                # long_perp: buy back borrowed token + auto-repay margin loan
+                margin_ex = _make_margin_exchange()
+                try:
+                    await margin_ex.load_markets()
+                    ticker_spot = await margin_ex.fetch_ticker(pos.spot_symbol)
+                    ref_spot = (float(ticker_spot.get("last") or 0) or
+                                float(ticker_spot.get("close") or 0) or pos.spot_entry_price)
+                    spot_ok = await _close_spot_margin_short(
+                        margin_ex, pos.spot_symbol, pos.size, ref_spot)
+                except Exception as e:
+                    logger.error("margin_close_exception", symbol=pos.symbol, error=str(e)[:200])
+                    spot_ok = False
+                finally:
+                    await margin_ex.close()
+            else:
+                # short_perp: sell back spot tokens we hold
+                spot_markets_ok = False
+                try:
+                    await spot_ex.load_markets()
+                    spot_markets_ok = True
+                except Exception as e:
+                    logger.error("spot_markets_unavailable_on_close", symbol=pos.symbol,
+                                 error=str(e)[:120])
 
-            if not spot_markets_ok:
-                # Perp already closed → we're delta-exposed on spot. Emergency.
-                logger.error(
-                    "CRITICAL_delta_exposed_spot_leg_cannot_reach",
-                    symbol=pos.symbol,
-                    note="Perp closed but spot exchange unreachable — "
-                         "manual spot close required!")
-                return False
+                if not spot_markets_ok:
+                    logger.error(
+                        "CRITICAL_delta_exposed_spot_leg_cannot_reach",
+                        symbol=pos.symbol,
+                        note="Perp closed but spot exchange unreachable — "
+                             "manual spot close required!")
+                    return False
 
-            ticker_spot = await spot_ex.fetch_ticker(pos.spot_symbol)
-            ref_spot = (float(ticker_spot.get("last") or 0) or
-                        float(ticker_spot.get("close") or 0) or pos.spot_entry_price)
+                ticker_spot = await spot_ex.fetch_ticker(pos.spot_symbol)
+                ref_spot = (float(ticker_spot.get("last") or 0) or
+                            float(ticker_spot.get("close") or 0) or pos.spot_entry_price)
+                spot_ok = await _close_spot_robust(
+                    spot_ex, pos.spot_symbol, spot_close_side, pos.size, ref_spot)
 
-            spot_ok = await _close_spot_robust(
-                spot_ex, pos.spot_symbol, spot_close_side, pos.size, ref_spot)
             if spot_ok:
                 pos.spot_closed = True
-                logger.info("spot_leg_closed", symbol=pos.symbol)
+                logger.info("spot_leg_closed", symbol=pos.symbol,
+                            mode="margin" if pos.spot_is_margin else "spot")
             else:
-                # Perp is flat, spot is still open → delta exposure!
                 logger.error(
                     "CRITICAL_delta_exposed_spot_close_failed",
                     symbol=pos.symbol,
@@ -820,13 +966,23 @@ async def run_farm() -> None:
             now = time.time()
             if len(positions) < MAX_POSITIONS and (now - last_scan_ts) >= SCAN_INTERVAL_S:
                 console.print(f"\n[cyan]Scanning (min {MIN_ENTRY_APY}% APY)…[/cyan]")
-                opps     = await scan(min_apy=MIN_ENTRY_APY, top_n=30)
+                opps     = await scan(min_apy=MIN_ENTRY_APY, top_n=200)
+                # Volume floor + blacklist
+                before = len(opps)
+                opps = [o for o in opps
+                        if o.volume_24h_usdt >= MIN_VOLUME_USD
+                        and o.symbol not in BLACKLIST]
+                if len(opps) < before:
+                    console.print(f"[dim]  {before - len(opps)} filtered by volume/blacklist "
+                                  f"(floor=${MIN_VOLUME_USD/1e6:.0f}M)[/dim]")
                 existing = {p.symbol for p in positions}
 
-                # Pre-filter: spot market exists + sufficient balance for leg
+                # Pre-filter: spot market exists + sufficient balance + borrow liquidity
                 spot_ex_check = _make_spot_exchange()
-                spot_symbols: set  = set()
-                spot_balances: dict = {}
+                spot_symbols:   set  = set()
+                spot_balances:  dict = {}
+                borrowable_set: set  = set()   # symbols with borrow liquidity (long_perp)
+                margin_usdt = 0.0
                 try:
                     await spot_ex_check.load_markets()
                     spot_symbols = set(spot_ex_check.markets.keys())
@@ -834,8 +990,49 @@ async def run_farm() -> None:
                     spot_balances = {k: float(v.get("free", 0))
                                      for k, v in bal.items()
                                      if isinstance(v, dict)}
+
+                    # Margin USDT for long_perp collateral check
+                    if not SPOT_TESTNET:
+                        try:
+                            resp = await spot_ex_check.sapi_get_margin_account()
+                            for a in resp.get("userAssets", []):
+                                if a["asset"] == "USDT":
+                                    margin_usdt = float(a.get("free") or 0)
+                        except Exception:
+                            pass
+
+                    # Borrow liquidity pre-check for long_perp on mainnet
+                    if not SPOT_TESTNET:
+                        for o in opps:
+                            if o.direction != "long_perp":
+                                borrowable_set.add(o.symbol)
+                                continue
+                            if f"{o.symbol}/USDT" not in spot_symbols:
+                                continue
+                            try:
+                                info  = await spot_ex_check.sapi_get_margin_maxborrowable(
+                                    {"asset": o.symbol})
+                                max_b  = float(info.get("amount") or 0)
+                                needed = POSITION_SIZE_USDT / (o.mid_price or 1.0)
+                                if max_b >= needed:
+                                    borrowable_set.add(o.symbol)
+                                    logger.debug("long_perp_borrow_ok",
+                                                 symbol=o.symbol, max_borrow=round(max_b, 2))
+                                else:
+                                    logger.info("long_perp_borrow_unavailable",
+                                                symbol=o.symbol, max_borrow=round(max_b, 2),
+                                                needed=round(needed, 2))
+                            except Exception as be:
+                                # -3045 or any error = not borrowable right now; skip
+                                logger.info("long_perp_borrow_check_failed",
+                                            symbol=o.symbol, error=str(be)[:80])
+                            await asyncio.sleep(0.05)
+                    else:
+                        borrowable_set = {o.symbol for o in opps}  # testnet: skip check
+
                 except Exception as e:
                     logger.warning("spot_prefilter_failed", error=str(e)[:100])
+                    borrowable_set = {o.symbol for o in opps}
                 finally:
                     await spot_ex_check.close()
 
@@ -844,21 +1041,21 @@ async def run_farm() -> None:
                 def _can_execute(opp: FundingOpp) -> bool:
                     if f"{opp.symbol}/USDT" not in spot_symbols:
                         return False
+                    if opp.symbol not in borrowable_set:
+                        return False
                     if opp.direction == "short_perp":
-                        # Need USDT to buy spot — require 105% headroom for slippage
                         return spot_usdt >= POSITION_SIZE_USDT * 1.05
                     else:
-                        # long_perp: short spot → need to hold enough of the token
-                        held      = spot_balances.get(opp.symbol, 0.0)
-                        price     = opp.mid_price or 1.0
-                        held_usdt = held * price
-                        # 100% threshold: if borderline, spot leg fails and rolls
-                        # back cleanly — better than over-filtering good opps
-                        return held_usdt >= POSITION_SIZE_USDT
+                        if SPOT_TESTNET:
+                            held  = spot_balances.get(opp.symbol, 0.0)
+                            return held * (opp.mid_price or 1.0) >= POSITION_SIZE_USDT
+                        else:
+                            # Need margin USDT as collateral (Binance ~10x margin ratio)
+                            return margin_usdt >= POSITION_SIZE_USDT * 0.5
 
                 opps = [o for o in opps if _can_execute(o)]
-                console.print(f"[dim]  {len(opps)} opps pass spot pre-filter "
-                              f"(USDT=${spot_usdt:.0f})[/dim]")
+                console.print(f"[dim]  {len(opps)} opps pass filter "
+                              f"(spot=${spot_usdt:.0f}, margin=${margin_usdt:.0f})[/dim]")
 
                 for opp in opps:
                     if len(positions) >= MAX_POSITIONS:
