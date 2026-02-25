@@ -51,17 +51,19 @@ console = Console()
 
 MIN_ARB_APY          = float(os.getenv("CARB_MIN_ARB_APY",        "15.0"))  # min differential to enter
 EXIT_ARB_APY         = float(os.getenv("CARB_EXIT_ARB_APY",        "5.0"))  # close when differential < this
-POSITION_SIZE_USDT   = float(os.getenv("CARB_POSITION_SIZE_USDT", "100.0")) # per-position notional
-MAX_POSITION_SIZE    = float(os.getenv("CARB_MAX_POSITION_SIZE",  "500.0")) # cap per position
-MAX_POSITIONS        = int(os.getenv(  "CARB_MAX_POSITIONS",         "5"))
-SCAN_INTERVAL_S      = int(os.getenv(  "CARB_SCAN_INTERVAL",       "1800"))  # 30 min
-MIN_HL_VOL_USD       = float(os.getenv("CARB_MIN_HL_VOL_USD",  "2000000"))  # $2M min HL daily volume
+POSITION_SIZE_USDT   = float(os.getenv("CARB_POSITION_SIZE_USDT", "300.0")) # per-position notional
+MAX_POSITION_SIZE    = float(os.getenv("CARB_MAX_POSITION_SIZE", "1000.0")) # cap per position
+MAX_POSITIONS        = int(os.getenv(  "CARB_MAX_POSITIONS",         "30"))
+SCAN_INTERVAL_S      = int(os.getenv(  "CARB_SCAN_INTERVAL",       "300"))  # 5 min
+MIN_HL_VOL_USD       = float(os.getenv("CARB_MIN_HL_VOL_USD",  "1000000"))  # $1M min HL daily volume
 MIN_BIN_VOL_USD      = float(os.getenv("CARB_MIN_BIN_VOL_USD","10000000"))  # $10M min Binance daily vol
-PERP_LEVERAGE        = int(os.getenv(  "CARB_LEVERAGE",               "5"))  # leverage on both sides
+PERP_LEVERAGE        = int(os.getenv(  "CARB_LEVERAGE",               "6"))  # 6x leverage (moderate)
 SLIPPAGE             = float(os.getenv("CARB_SLIPPAGE",            "0.02"))  # 2% HL market order slippage
 RT_FEE_PCT           = 0.0028   # 0.04% perp taker × 2 legs × 2 exchanges (conservative)
 
 STATE_FILE = "/tmp/cross-arb-state.json"
+HISTORY_FILE = "/tmp/cross-arb-history.jsonl"
+TIMESERIES_FILE = "/tmp/cross-arb-timeseries.jsonl"
 
 BLACKLIST = set(os.getenv("CARB_BLACKLIST", "").split(",")) - {""}
 
@@ -123,6 +125,203 @@ def load_state() -> list[ArbPosition]:
     except Exception as e:
         logger.warning("load_state_failed", error=str(e))
         return []
+
+
+# ── Time-Series Tracking ─────────────────────────────────────────────────────
+
+def log_timeseries_event(event_type: str, data: dict) -> None:
+    """Append a time-series event to the JSONL file."""
+    try:
+        with open(TIMESERIES_FILE, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "type": event_type, **data}) + "\n")
+    except Exception as e:
+        logger.warning("timeseries_log_failed", error=str(e))
+
+
+def record_position_open(pos: ArbPosition) -> None:
+    """Record position open in time-series."""
+    log_timeseries_event("position_open", {
+        "symbol": pos.symbol,
+        "bin_side": pos.bin_side,
+        "hl_side": pos.hl_side,
+        "notional": pos.notional_usdt,
+        "entry_apy": pos.entry_net_apy,
+        "entry_ts": pos.entry_ts,
+    })
+
+
+def record_position_close(pos: ArbPosition, exit_apy: float, realized_pnl: float) -> None:
+    """Record position close in time-series."""
+    log_timeseries_event("position_close", {
+        "symbol": pos.symbol,
+        "bin_side": pos.bin_side,
+        "hl_side": pos.hl_side,
+        "notional": pos.notional_usdt,
+        "entry_apy": pos.entry_net_apy,
+        "exit_apy": exit_apy,
+        "entry_ts": pos.entry_ts,
+        "close_ts": time.time(),
+        "duration_hours": (time.time() - pos.entry_ts) / 3600,
+        "realized_pnl": realized_pnl,
+    })
+
+
+def record_hourly_checkpoint(positions: list[ArbPosition], hl_equity: float, bin_equity: float) -> None:
+    """Record hourly portfolio snapshot."""
+    total_notional = sum(p.notional_usdt for p in positions)
+    log_timeseries_event("hourly_checkpoint", {
+        "positions_open": len(positions),
+        "total_notional": total_notional,
+        "hl_equity": hl_equity,
+        "bin_equity": bin_equity,
+        "total_portfolio": hl_equity + bin_equity,
+    })
+
+
+def load_timeseries_events(event_type: str = None, limit: int = None) -> list[dict]:
+    """Load time-series events from file."""
+    if not os.path.exists(TIMESERIES_FILE):
+        return []
+    events = []
+    try:
+        with open(TIMESERIES_FILE) as f:
+            for line in f:
+                try:
+                    event = json.loads(line.strip())
+                    if event_type is None or event.get("type") == event_type:
+                        events.append(event)
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        logger.warning("timeseries_load_failed", error=str(e))
+    
+    if limit:
+        events = events[-limit:]
+    return events
+
+
+def calculate_historical_stats() -> dict:
+    """Calculate historical performance metrics from time-series data."""
+    events = load_timeseries_events("position_close")
+    if not events:
+        return {
+            "total_trades": 0,
+            "winning_trades": 0,
+            "losing_trades": 0,
+            "win_rate": 0.0,
+            "total_realized_pnl": 0.0,
+            "avg_pnl_per_trade": 0.0,
+            "avg_duration_hours": 0.0,
+            "total_notional_traded": 0.0,
+        }
+    
+    winning = [e for e in events if e.get("realized_pnl", 0) > 0]
+    losing = [e for e in events if e.get("realized_pnl", 0) < 0]
+    
+    total_pnl = sum(e.get("realized_pnl", 0) for e in events)
+    durations = [e.get("duration_hours", 0) for e in events if e.get("duration_hours")]
+    notionals = [e.get("notional", 0) for e in events]
+    
+    return {
+        "total_trades": len(events),
+        "winning_trades": len(winning),
+        "losing_trades": len(losing),
+        "win_rate": len(winning) / len(events) * 100 if events else 0,
+        "total_realized_pnl": total_pnl,
+        "avg_pnl_per_trade": total_pnl / len(events) if events else 0,
+        "avg_duration_hours": sum(durations) / len(durations) if durations else 0,
+        "total_notional_traded": sum(notionals),
+    }
+
+
+def show_historical_stats(period: str = "all") -> None:
+    """Display historical performance stats."""
+    from datetime import datetime, timedelta
+    
+    events = load_timeseries_events("position_close")
+    if not events:
+        console.print("[yellow]No closed positions in time-series history.[/yellow]")
+        return
+    
+    # Filter by period
+    now = time.time()
+    if period == "today":
+        start_ts = datetime.now().replace(hour=0, minute=0, second=0).timestamp()
+    elif period == "week":
+        start_ts = now - 7 * 24 * 3600
+    elif period == "month":
+        start_ts = now - 30 * 24 * 3600
+    else:
+        start_ts = 0
+    
+    filtered = [e for e in events if e.get("close_ts", 0) >= start_ts]
+    
+    if not filtered:
+        console.print(f"[yellow]No closed positions in the last {period}.[/yellow]")
+        return
+    
+    winning = [e for e in filtered if e.get("realized_pnl", 0) > 0]
+    losing = [e for e in filtered if e.get("realized_pnl", 0) < 0]
+    
+    total_pnl = sum(e.get("realized_pnl", 0) for e in filtered)
+    durations = [e.get("duration_hours", 0) for e in filtered if e.get("duration_hours")]
+    notionals = [e.get("notional", 0) for e in filtered]
+    entry_apys = [e.get("entry_apy", 0) for e in filtered]
+    
+    win_rate = len(winning) / len(filtered) * 100
+    avg_dur = sum(durations) / len(durations) if durations else 0
+    avg_notional = sum(notionals) / len(notionals) if notionals else 0
+    avg_entry_apy = sum(entry_apys) / len(entry_apys) if entry_apys else 0
+    
+    # Calculate estimated daily return
+    total_days = sum(durations) / 24 if durations else 1
+    daily_avg = total_pnl / total_days if total_days > 0 else 0
+    
+    # Total return % (vs total notional traded)
+    total_notional = sum(notionals)
+    total_return_pct = (total_pnl / total_notional * 100) if total_notional > 0 else 0
+    
+    t = Table(title=f"📊 Historical Stats ({period})")
+    t.add_column("Metric", style="cyan")
+    t.add_column("Value", style="green", justify="right")
+    
+    t.add_row("Total Trades", str(len(filtered)))
+    t.add_row("Winning Trades", f"{len(winning)} ({win_rate:.1f}%)")
+    t.add_row("Losing Trades", str(len(losing)))
+    t.add_row("Total Realized P&L", f"${total_pnl:.4f}")
+    t.add_row("Avg P&L per Trade", f"${total_pnl/len(filtered):.4f}")
+    t.add_row("Avg Position Duration", f"{avg_dur:.2f} hrs")
+    t.add_row("Avg Notional", f"${avg_notional:.0f}")
+    t.add_row("Avg Entry APY", f"{avg_entry_apy:.1f}%")
+    t.add_row("Total Notional Traded", f"${total_notional:.0f}")
+    t.add_row("Total Return %", f"{total_return_pct:.2f}%")
+    t.add_row("Est. Daily Avg P&L", f"${daily_avg:.4f}")
+    
+    console.print(t)
+    
+    # Recent closes table
+    recent = sorted(filtered, key=lambda x: x.get("close_ts", 0), reverse=True)[:10]
+    if recent:
+        rt = Table(title="Recent Closed Positions")
+        rt.add_column("Symbol", style="cyan")
+        rt.add_column("Notional", justify="right")
+        rt.add_column("Entry APY", justify="right")
+        rt.add_column("Exit APY", justify="right")
+        rt.add_column("Duration", justify="right")
+        rt.add_column("P&L", justify="right", style="green" if total_pnl > 0 else "red")
+        
+        for e in recent:
+            pnl = e.get("realized_pnl", 0)
+            color = "green" if pnl > 0 else ("red" if pnl < 0 else "white")
+            rt.add_row(
+                e.get("symbol", "?"),
+                f"${e.get('notional', 0):.0f}",
+                f"{e.get('entry_apy', 0):.0f}%",
+                f"{e.get('exit_apy', 0):.0f}%",
+                f"{e.get('duration_hours', 0):.1f}h",
+                f"[{color}]${pnl:.4f}[/{color}]"
+            )
+        console.print(rt)
 
 
 # ── Scanner ───────────────────────────────────────────────────────────────────
@@ -346,6 +545,8 @@ async def open_arb_position(
             last_hl_apy   = opp.hl_apy,
             last_rate_ts  = time.time(),
         )
+        # Record time-series event
+        record_position_open(pos)
         logger.info("arb_position_opened", symbol=opp.symbol,
                     notional=round(notional, 2), net_apy=round(opp.net_apy, 1))
         return pos
@@ -426,16 +627,23 @@ async def close_arb_position(pos: ArbPosition) -> bool:
 
 # ── Display ───────────────────────────────────────────────────────────────────
 
-def show_arb_status(positions: list[ArbPosition]) -> None:
+def show_arb_status(positions: list[ArbPosition], hl_equity: float = 0, bin_free: float = 0) -> None:
     if not positions:
         console.print("[yellow]No active cross-arb positions.[/yellow]")
         return
 
+    total_portfolio = hl_equity + bin_free * PERP_LEVERAGE
+    
     t = Table(title="⚙️  Cross-Exchange Arb Positions")
     for col, justify in [
-        ("Symbol", "left"), ("Notional", "right"), ("Entry Net APY", "right"),
-        ("Live Net APY", "right"), ("$/day", "right"), ("Bin Side", "center"),
-        ("HL Side", "center"), ("Age", "right"),
+        ("Symbol", "left"), 
+        ("Notional", "right"), 
+        ("% Port", "right"),
+        ("Entry APY", "right"),
+        ("Live APY", "right"), 
+        ("$/day", "right"), 
+        ("Tier", "right"),
+        ("Age", "right"),
     ]:
         t.add_column(col, justify=justify)
 
@@ -449,29 +657,63 @@ def show_arb_status(positions: list[ArbPosition]) -> None:
         # Live net APY
         bin_earn_sign = 1 if pos.bin_side == "buy" else -1
         hl_earn_sign  = 1 if pos.hl_side == "buy" else -1
-        live_bin = pos.last_bin_apy * bin_earn_sign * (-1)  # flip: earn = negative rate * long
+        live_bin = pos.last_bin_apy * bin_earn_sign * (-1)
         live_hl  = pos.last_hl_apy  * hl_earn_sign  * (-1)
-        live_net = live_bin + live_hl
+        
+        # Handle both-negative case (both legs earn)
+        if pos.last_bin_apy < 0 and pos.last_hl_apy < 0:
+            live_net = abs(pos.last_bin_apy) + abs(pos.last_hl_apy)
+        else:
+            live_net = live_bin + live_hl
+            
         daily    = pos.notional_usdt * live_net / 100.0 / 365.0
         total_notional += pos.notional_usdt
         total_daily    += daily
+        
+        # Position as % of portfolio
+        port_pct = (pos.notional_usdt / total_portfolio * 100) if total_portfolio > 0 else 0
+        
+        # APY tier indicator
+        if pos.entry_net_apy >= 500:
+            tier = "★★★"
+        elif pos.entry_net_apy >= 200:
+            tier = "★★"
+        elif pos.entry_net_apy >= 100:
+            tier = "★"
+        else:
+            tier = "-"
+        
+        # Color based on live APY
+        if live_net > 50:
+            color = "green"
+        elif live_net > EXIT_ARB_APY:
+            color = "bright_green"
+        elif live_net > 0:
+            color = "yellow"
+        else:
+            color = "red"
 
-        color = "green" if live_net > EXIT_ARB_APY else ("yellow" if live_net > 0 else "red")
         t.add_row(
             pos.symbol,
             f"${pos.notional_usdt:.0f}",
-            f"{pos.entry_net_apy:.1f}%",
-            f"[{color}]{live_net:.1f}%[/{color}]",
+            f"{port_pct:.0f}%",
+            f"{pos.entry_net_apy:.0f}%",
+            f"[{color}]{live_net:.0f}%[/{color}]",
             f"${daily:.4f}",
-            pos.bin_side,
-            pos.hl_side,
+            tier,
             age_str,
         )
 
     console.print(t)
+    
+    # Risk summary
+    leveraged = total_notional / total_portfolio * 100 if total_portfolio > 0 else 0
     console.print(
-        f"  [dim]Total notional: ${total_notional:.0f}  |  "
-        f"Est. daily net: [/dim][bold green]${total_daily:.4f}[/bold green]"
+        f"[dim]Total notional: ${total_notional:.0f}  |  "
+        f"Leverage: {leveraged:.0f}%  |  "
+        f"Est. daily: [/dim][bold green]${total_daily:.4f}[/bold green]"
+        f"[dim]  |  "
+        f"APY: {total_daily/total_notional*365*100:.1f}%[/dim]"
     )
 
 
@@ -530,9 +772,39 @@ async def run_cross_arb() -> None:
 
     positions: list[ArbPosition] = load_state()
     last_scan_ts = 0.0
+    last_checkpoint_ts = 0.0
+    hl_equity = 0.0
+    bin_equity = 0.0
 
     while True:
         now = time.time()
+
+        # ── Hourly checkpoint (record portfolio state) ────────────────────────
+        if now - last_checkpoint_ts >= 3600:
+            try:
+                hl = make_hl_client()
+                hl_equity = hl.get_equity()
+                # Get Binance equity
+                key_path = os.getenv("BINANCE_PRIVATE_KEY_PATH", "")
+                secret = open(key_path).read() if key_path and os.path.exists(key_path) else ""
+                bin_ex = ccxt.binanceusdm({
+                    "apiKey": os.getenv("BINANCE_API_KEY", ""),
+                    "secret": secret,
+                    "options": {"defaultType": "future"},
+                    "enableRateLimit": True,
+                })
+                try:
+                    await bin_ex.load_markets()
+                    bin_bal = await bin_ex.fetch_balance({"type": "future"})
+                    bin_equity = float((bin_bal.get("USDT") or {}).get("total", 0))
+                finally:
+                    await bin_ex.close()
+                record_hourly_checkpoint(positions, hl_equity, bin_equity)
+                logger.info("hourly_checkpoint_recorded", positions=len(positions), 
+                           hl_equity=hl_equity, bin_equity=bin_equity)
+            except Exception as e:
+                logger.warning("checkpoint_failed", error=str(e)[:120])
+            last_checkpoint_ts = now
 
         # ── 1. Rate refresh (every 10 min regardless of scan cycle) ──────────
         if positions and (now - min((p.last_rate_ts for p in positions), default=0)) > 600:
@@ -576,6 +848,24 @@ async def run_cross_arb() -> None:
                     )
                 ok = await close_arb_position(pos)
                 if ok:
+                    # Calculate exit APY and record close
+                    exit_bin = pos.last_bin_apy
+                    exit_hl = pos.last_hl_apy
+                    # Approximate exit net APY (using last known rates)
+                    bin_earn_sign = 1 if pos.bin_side == "buy" else -1
+                    hl_earn_sign = 1 if pos.hl_side == "buy" else -1
+                    live_bin = exit_bin * bin_earn_sign * (-1)
+                    live_hl = exit_hl * hl_earn_sign * (-1)
+                    if exit_bin < 0 and exit_hl < 0:
+                        exit_net = abs(exit_bin) + abs(exit_hl)
+                    else:
+                        exit_net = live_bin + live_hl
+                    
+                    # Calculate realized P&L (simplified - from position data)
+                    # Using funding_realized fields which track realized funding
+                    realized_pnl = pos.funding_realized_hl + pos.funding_realized_bin
+                    
+                    record_position_close(pos, exit_net, realized_pnl)
                     positions.remove(pos)
                     save_state(positions)
                     console.print(f"[green]✓ {pos.symbol} arb closed[/green]")
@@ -639,6 +929,29 @@ async def run_cross_arb() -> None:
                 for opp in new_opps:
                     if len(positions) >= MAX_POSITIONS:
                         break
+                    
+                    # APY-tiered sizing - more aggressive but capped
+                    if opp.net_apy >= 500:
+                        pos_size = POSITION_SIZE_USDT * 3.5
+                    elif opp.net_apy >= 200:
+                        pos_size = POSITION_SIZE_USDT * 2.5
+                    elif opp.net_apy >= 100:
+                        pos_size = POSITION_SIZE_USDT * 2.0
+                    elif opp.net_apy >= 50:
+                        pos_size = POSITION_SIZE_USDT * 1.5
+                    else:
+                        pos_size = POSITION_SIZE_USDT * 1.0
+                    
+                    # Cap per position at MAX_POSITION_SIZE (safety)
+                    pos_size = min(pos_size, MAX_POSITION_SIZE)
+                    
+                    # Additional cap: max 15% of portfolio in single token
+                    total_portfolio = hl_equity + bin_free * PERP_LEVERAGE
+                    max_per_position = total_portfolio * 0.15
+                    pos_size = min(pos_size, max_per_position)
+                    
+                    per_pos_margin = pos_size / PERP_LEVERAGE
+                    
                     # Break-even check: fees / net_apy
                     be_days = (RT_FEE_PCT * 365.0) / (opp.net_apy / 100.0) if opp.net_apy > 0 else 999
                     if be_days > 30:
@@ -654,7 +967,7 @@ async def run_cross_arb() -> None:
                         f"({'long' if opp.bin_side == 'buy' else 'short'} Bin + "
                         f"{'long' if opp.hl_side == 'buy' else 'short'} HL)[/green]"
                     )
-                    pos = await open_arb_position(opp, POSITION_SIZE_USDT)
+                    pos = await open_arb_position(opp, pos_size)
                     await asyncio.sleep(3.0)
                     if pos:
                         positions.append(pos)
@@ -666,7 +979,30 @@ async def run_cross_arb() -> None:
             except Exception as e:
                 logger.error("scan_error", error=str(e)[:200])
 
-            show_arb_status(positions)
+            # Get equity for portfolio calculation and display
+            try:
+                from hl_client import make_hl_client
+                hl = make_hl_client()
+                hl_equity = hl.get_equity()
+                # Also get Binance equity
+                key_path = os.getenv("BINANCE_PRIVATE_KEY_PATH", "")
+                secret = open(key_path).read() if key_path and os.path.exists(key_path) else ""
+                bin_ex = ccxt.binanceusdm({
+                    "apiKey": os.getenv("BINANCE_API_KEY", ""),
+                    "secret": secret,
+                    "options": {"defaultType": "future"},
+                    "enableRateLimit": True,
+                })
+                try:
+                    await bin_ex.load_markets()
+                    bin_bal = await bin_ex.fetch_balance({"type": "future"})
+                    bin_equity = float((bin_bal.get("USDT") or {}).get("total", 0))
+                finally:
+                    await bin_ex.close()
+                show_arb_status(positions, hl_equity, bin_equity)
+            except Exception as e:
+                logger.warning("equity_fetch_failed", error=str(e)[:120])
+                show_arb_status(positions, hl_equity, bin_equity)
             last_scan_ts = time.time()
             next_min = SCAN_INTERVAL_S // 60
             console.print(f"\n[dim]Next scan in {next_min}min[/dim]")
@@ -682,6 +1018,9 @@ async def main() -> None:
     parser.add_argument("--scan",   action="store_true", help="Scan and print opportunities")
     parser.add_argument("--status", action="store_true", help="Show active positions")
     parser.add_argument("--close",  type=str,            help="Close position by symbol")
+    parser.add_argument("--history", type=str, nargs="?", const="all", 
+                        choices=["all", "today", "week", "month"],
+                        help="Show historical stats (all/today/week/month)")
     parser.add_argument("--min-apy", type=float, default=MIN_ARB_APY)
     args = parser.parse_args()
 
@@ -689,7 +1028,15 @@ async def main() -> None:
         await run_scan_only(args.min_apy)
     elif args.status:
         positions = load_state()
-        show_arb_status(positions)
+        try:
+            from hl_client import make_hl_client
+            hl = make_hl_client()
+            eq = hl.get_equity()
+            show_arb_status(positions, eq, 0)
+        except:
+            show_arb_status(positions, 0, 0)
+    elif args.history is not None:
+        show_historical_stats(args.history)
     elif args.close:
         positions = load_state()
         sym = args.close.upper()
@@ -701,6 +1048,9 @@ async def main() -> None:
             pos.needs_close = True
             ok = await close_arb_position(pos)
             if ok:
+                # Record close event
+                realized_pnl = pos.funding_realized_hl + pos.funding_realized_bin
+                record_position_close(pos, pos.last_hl_apy, realized_pnl)
                 positions.remove(pos)
                 save_state(positions)
                 console.print(f"[green]✓ {sym} closed[/green]")

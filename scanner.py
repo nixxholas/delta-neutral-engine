@@ -90,8 +90,16 @@ async def scan(
     try:
         await asyncio.gather(perp_ex.load_markets(), spot_ex.load_markets())
 
-        # ── 1. Bulk perp funding rates ─────────────────────────────────────────
-        rates_raw = await perp_ex.fapiPublicGetPremiumIndex({})
+        # ── 1. Bulk perp funding rates + interval metadata ────────────────────
+        rates_raw, funding_info_raw = await asyncio.gather(
+            perp_ex.fapiPublicGetPremiumIndex({}),
+            perp_ex.fapiPublicGetFundingInfo({}),
+        )
+        # {symbolUSDT → settlement hours} e.g. AZTECUSDT → 1, EIGENUSDT → 4
+        funding_interval: dict[str, int] = {
+            r["symbol"]: int(r.get("fundingIntervalHours", 8))
+            for r in funding_info_raw
+        }
 
         # ── 2. Bulk perp 24h volumes + prices ─────────────────────────────────
         perp_vol, perp_price = await _bulk_perp_volumes(perp_ex)
@@ -125,7 +133,9 @@ async def scan(
             if not (mkt.get("linear") and mkt.get("swap")):
                 continue
 
-            apy = rate * 3 * 365 * 100
+            # Correct APY using actual settlement interval (not hardcoded 8h/3×)
+            interval_h = funding_interval.get(sym_raw, 8)
+            apy = rate * (24 / interval_h) * 365 * 100
             if abs(apy) < min_apy:
                 continue
 
