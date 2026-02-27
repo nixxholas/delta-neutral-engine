@@ -1,2 +1,15 @@
 .env
+.env.*
 keys/
+*.pem
+*.key
+__pycache__/
+*.pyc
+venv/
+node_modules/
+/tmp/
+*.log
+*-state.json
+*-timeseries.jsonl
+*-history.jsonl
+*-dashboard.json

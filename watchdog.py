@@ -25,8 +25,8 @@ from pathlib import Path
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-BOT_TOKEN = "8236078404:AAGyY0RwES8fWJ1w2pF5Z3Bh7PV5P3HkBH8"
-CHAT_ID   = "25836422"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 FARM_DIR  = Path(__file__).parent
 VENV_PYTHON = FARM_DIR.parent / "hl-mmbot" / "venv" / "bin" / "python3"

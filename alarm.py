@@ -34,8 +34,8 @@ ENV_FILE   = ROOT / ".env"
 STATE_FILE = Path("/tmp/cross-arb-state.json")
 ALERT_FILE = Path("/tmp/cross-arb-alerts.json")  # tracks last alert per symbol
 
-BOT_TOKEN = "8236078404:AAGyY0RwES8fWJ1w2pF5Z3Bh7PV5P3HkBH8"
-CHAT_ID   = "25836422"
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 EXIT_APY         = 5.0    # below this → WARNING
 DECAY_THRESHOLD  = 0.60   # >60% of entry APY lost → DECAY alarm

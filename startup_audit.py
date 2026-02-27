@@ -27,6 +27,7 @@ State:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import urllib.request
 import urllib.parse
@@ -43,8 +44,8 @@ STATE_FILE    = Path("/tmp/startup-audit-state.json")
 WORKSPACE     = Path("/Users/nicholas/workspace")
 SESSIONS_DIR  = Path.home() / ".openclaw" / "agents" / "main" / "sessions"
 
-BOT_TOKEN     = "8236078404:AAGyY0RwES8fWJ1w2pF5Z3Bh7PV5P3HkBH8"
-CHAT_ID       = "25836422"
+BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID       = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Files to inject on compaction (relative to WORKSPACE)
 STARTUP_FILES = [
