@@ -654,17 +654,12 @@ def show_arb_status(positions: list[ArbPosition], hl_equity: float = 0, bin_free
         age_h = (now - pos.entry_ts) / 3600
         age_str = f"{age_h/24:.1f}d" if age_h >= 24 else f"{age_h:.1f}h"
 
-        # Live net APY
+        # Live net APY — unified formula (works for all sign combos)
         bin_earn_sign = 1 if pos.bin_side == "buy" else -1
         hl_earn_sign  = 1 if pos.hl_side == "buy" else -1
         live_bin = pos.last_bin_apy * bin_earn_sign * (-1)
         live_hl  = pos.last_hl_apy  * hl_earn_sign  * (-1)
-        
-        # Handle both-negative case (both legs earn)
-        if pos.last_bin_apy < 0 and pos.last_hl_apy < 0:
-            live_net = abs(pos.last_bin_apy) + abs(pos.last_hl_apy)
-        else:
-            live_net = live_bin + live_hl
+        live_net = live_bin + live_hl
             
         daily    = pos.notional_usdt * live_net / 100.0 / 365.0
         total_notional += pos.notional_usdt
@@ -807,7 +802,7 @@ async def run_cross_arb() -> None:
             last_checkpoint_ts = now
 
         # ── 1. Rate refresh (every 10 min regardless of scan cycle) ──────────
-        if positions and (now - min((p.last_rate_ts for p in positions), default=0)) > 600:
+        if positions and (now - min((p.last_rate_ts for p in positions), default=0)) > 300:
             try:
                 hl = make_hl_client()
                 hl_meta2, hl_ctxs2 = hl._info.meta_and_asset_ctxs()
@@ -856,10 +851,7 @@ async def run_cross_arb() -> None:
                     hl_earn_sign = 1 if pos.hl_side == "buy" else -1
                     live_bin = exit_bin * bin_earn_sign * (-1)
                     live_hl = exit_hl * hl_earn_sign * (-1)
-                    if exit_bin < 0 and exit_hl < 0:
-                        exit_net = abs(exit_bin) + abs(exit_hl)
-                    else:
-                        exit_net = live_bin + live_hl
+                    exit_net = live_bin + live_hl
                     
                     # Calculate realized P&L (simplified - from position data)
                     # Using funding_realized fields which track realized funding
