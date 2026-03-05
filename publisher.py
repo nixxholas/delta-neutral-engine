@@ -97,15 +97,42 @@ def load_positions() -> list[dict]:
         return []
 
 def load_history(max_events: int = 100) -> list[dict]:
+    """Load open/close events from timeseries file (primary) or history file (legacy)."""
     events: list[dict] = []
+    # Primary: read from timeseries JSONL (has position_open/position_close events)
+    source = TIMESERIES_FILE if TIMESERIES_FILE.exists() else HISTORY_FILE
     try:
-        for line in HISTORY_FILE.read_text().splitlines():
+        for line in source.read_text().splitlines():
             line = line.strip()
-            if line:
-                try:
-                    events.append(json.loads(line))
-                except Exception:
-                    pass
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+                etype = ev.get("type", "")
+                # Normalize timeseries events to history format
+                if etype in ("position_open", "open"):
+                    events.append({
+                        "type": "open",
+                        "ts": ev.get("ts", 0),
+                        "symbol": ev.get("symbol", ""),
+                        "notional": ev.get("notional", 0),
+                        "entry_apy": ev.get("entry_apy", 0),
+                        "bin_side": ev.get("bin_side", ""),
+                        "hl_side": ev.get("hl_side", ""),
+                    })
+                elif etype in ("position_close", "close"):
+                    events.append({
+                        "type": "close",
+                        "ts": ev.get("ts", 0),
+                        "symbol": ev.get("symbol", ""),
+                        "notional": ev.get("notional", 0),
+                        "entry_apy": ev.get("entry_apy", 0),
+                        "exit_apy": ev.get("exit_apy", 0),
+                        "realized_total": ev.get("realized_pnl", ev.get("realized_total", 0)),
+                        "age_hours": ev.get("age_hours", 0),
+                    })
+            except Exception:
+                pass
     except Exception:
         pass
     return sorted(events, key=lambda e: e.get("ts", 0), reverse=True)[:max_events]
