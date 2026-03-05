@@ -51,6 +51,7 @@ console = Console()
 
 MIN_ARB_APY          = float(os.getenv("CARB_MIN_ARB_APY",        "15.0"))  # min differential to enter
 EXIT_ARB_APY         = float(os.getenv("CARB_EXIT_ARB_APY",        "5.0"))  # close when differential < this
+MIN_HOLD_HOURS       = float(os.getenv("CARB_MIN_HOLD_HOURS",      "8.0"))  # minimum hold before exit (fee break-even gate)
 POSITION_SIZE_USDT   = float(os.getenv("CARB_POSITION_SIZE_USDT", "300.0")) # per-position notional
 MAX_POSITION_SIZE    = float(os.getenv("CARB_MAX_POSITION_SIZE", "1000.0")) # cap per position
 MAX_POSITIONS        = int(os.getenv(  "CARB_MAX_POSITIONS",         "30"))
@@ -59,13 +60,23 @@ MIN_HL_VOL_USD       = float(os.getenv("CARB_MIN_HL_VOL_USD",  "1000000"))  # $1
 MIN_BIN_VOL_USD      = float(os.getenv("CARB_MIN_BIN_VOL_USD","10000000"))  # $10M min Binance daily vol
 PERP_LEVERAGE        = int(os.getenv(  "CARB_LEVERAGE",               "6"))  # 6x leverage (moderate)
 SLIPPAGE             = float(os.getenv("CARB_SLIPPAGE",            "0.02"))  # 2% HL market order slippage
-RT_FEE_PCT           = 0.0028   # 0.04% perp taker × 2 legs × 2 exchanges (conservative)
+SLIPPAGE_FORCE_CLOSE = float(os.getenv("CARB_SLIPPAGE_FORCE",       "0.04"))  # 4% slippage for forced closes
+RT_FEE_PCT           = 0.0017   # Binance 0.05% + HL 0.035% = 0.085% per way × 2 (open+close) = 0.17%
 
 STATE_FILE = "/tmp/cross-arb-state.json"
+ALERTS_FILE = "/tmp/cross-arb-alerts.json"
+
+# Circuit breaker state
+_close_failure_timestamps: list[float] = []
+CIRCUIT_BREAKER_WINDOW_S = 1800  # 30 minutes
+CIRCUIT_BREAKER_THRESHOLD = 3   # 3 failures triggers pause
 HISTORY_FILE = "/tmp/cross-arb-history.jsonl"
 TIMESERIES_FILE = "/tmp/cross-arb-timeseries.jsonl"
 
 BLACKLIST = set(os.getenv("CARB_BLACKLIST", "").split(",")) - {""}
+
+# Slippage gate threshold (in basis points)
+SLIPPAGE_GATE_BPS = 15.0  # 0.15% max combined slippage on entry
 
 # ── Data ──────────────────────────────────────────────────────────────────────
 
@@ -74,11 +85,12 @@ class ArbOpp:
     symbol:       str
     bin_apy:      float   # Binance annualised APY (negative = longs earn)
     hl_apy:       float   # HL annualised APY      (negative = longs earn)
-    net_apy:      float   # expected differential earned (always positive if viable)
-    bin_side:     str     # "buy" (long) | "sell" (short) on Binance
-    hl_side:      str     # "buy" (long) | "sell" (short) on HL
-    bin_vol:      float   # Binance 24h volume
-    hl_vol:       float   # HL 24h volume
+    net_apy:      float   # expected differential earned (adjusted for timing)
+    raw_net_apy:  float = 0.0  # Original net APY before timing adjustment
+    bin_side:     str = ""  # "buy" (long) | "sell" (short) on Binance
+    hl_side:      str = ""  # "buy" (long) | "sell" (short) on HL
+    bin_vol:      float = 0.0  # Binance 24h volume
+    hl_vol:       float = 0.0  # HL 24h volume
 
 
 @dataclass
@@ -106,13 +118,38 @@ class ArbPosition:
     funding_realized_bin: float = 0.0
     funding_realized_hl:  float = 0.0
     needs_close:   bool  = False
+    # --- Patch A: Cost tracking ---
+    bin_entry_slippage_bps: float = 0.0
+    hl_entry_slippage_bps: float = 0.0
+    bin_exit_fill: float = 0.0
+    hl_exit_fill: float = 0.0
+    bin_exit_slippage_bps: float = 0.0
+    hl_exit_slippage_bps: float = 0.0
+    exit_bin_apy: float = 0.0
+    exit_hl_apy: float = 0.0
+    exit_net_apy: float = 0.0
+    true_pnl: float = 0.0
+    # --- Patch C: Close robustness tracking ---
+    bin_close_ts:  Optional[float] = None
+    hl_close_ts:   Optional[float] = None
+    close_failure_count: int = 0
 
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
 def save_state(positions: list[ArbPosition]) -> None:
-    with open(STATE_FILE, "w") as f:
-        json.dump([asdict(p) for p in positions], f, indent=2)
+    """Save positions to state file atomically (write to temp then rename)."""
+    import tempfile
+    data = [asdict(p) for p in positions]
+    fd, tmp = tempfile.mkstemp(dir='/tmp', suffix='.json')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, STATE_FILE)  # Atomic on POSIX
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
 
 
 def load_state() -> list[ArbPosition]:
@@ -125,6 +162,47 @@ def load_state() -> list[ArbPosition]:
     except Exception as e:
         logger.warning("load_state_failed", error=str(e))
         return []
+
+
+# ── Funding Tracking ─────────────────────────────────────────────────────────
+
+def _update_realized_funding(pos: ArbPosition, current_bin_apy: float, current_hl_apy: float) -> None:
+    """
+    Update realized funding for a position based on time elapsed and current rates.
+    Should be called periodically (e.g., every rate refresh).
+    """
+    now = time.time()
+
+    if pos.last_rate_ts <= 0:
+        pos.last_rate_ts = now
+        return
+
+    hours_elapsed = (now - pos.last_rate_ts) / 3600.0
+    if hours_elapsed <= 0:
+        return
+
+    # Sign convention matches live APY: rate * earn_sign * (-1)
+    # e.g. bin_apy=-10%, long (earn_sign=1): -10 * 1 * (-1) = +10% → we earn
+    bin_earn_sign = 1 if pos.bin_side == "buy" else -1
+    bin_hourly_rate = current_bin_apy / 100.0 / 365.0
+    bin_funding_this_interval = bin_hourly_rate * bin_earn_sign * (-1) * pos.notional_usdt * hours_elapsed
+
+    hl_earn_sign = 1 if pos.hl_side == "buy" else -1
+    hl_hourly_rate = current_hl_apy / 100.0 / 365.0
+    hl_funding_this_interval = hl_hourly_rate * hl_earn_sign * (-1) * pos.notional_usdt * hours_elapsed
+
+    pos.funding_realized_bin += bin_funding_this_interval
+    pos.funding_realized_hl += hl_funding_this_interval
+
+    logger.debug("funding_updated",
+                  symbol=pos.symbol,
+                  hours_elapsed=round(hours_elapsed, 3),
+                  bin_rate=current_bin_apy,
+                  hl_rate=current_hl_apy,
+                  bin_funding=round(bin_funding_this_interval, 4),
+                  hl_funding=round(hl_funding_this_interval, 4),
+                  total_bin=round(pos.funding_realized_bin, 4),
+                  total_hl=round(pos.funding_realized_hl, 4))
 
 
 # ── Time-Series Tracking ─────────────────────────────────────────────────────
@@ -324,6 +402,392 @@ def show_historical_stats(period: str = "all") -> None:
         console.print(rt)
 
 
+# ── Smart Entry Config (Patch B) ─────────────────────────────────────────────
+RATE_HISTORY_FILE   = "/tmp/cross-arb-rate-history.json"
+COOLDOWN_FILE       = "/tmp/cross-arb-cooldowns.json"
+MIN_ARB_APY_PERSISTENT = int(os.getenv("CARB_MIN_ARB_PERSISTENT", "2"))  # observations out of 3 that must exceed threshold
+MIN_STABILITY_SCORE = float(os.getenv("CARB_MIN_STABILITY_SCORE", "0.3"))  # stability gate (0.0 = disabled)
+
+
+# ── Rate History (Mean-Reversion Filter) ─────────────────────────────────────
+
+def load_rate_history() -> dict[str, list[dict]]:
+    """Load rate history from file."""
+    if not os.path.exists(RATE_HISTORY_FILE):
+        return {}
+    try:
+        with open(RATE_HISTORY_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_rate_history(history: dict[str, list[dict]]) -> None:
+    """Save rate history to file."""
+    with open(RATE_HISTORY_FILE, "w") as f:
+        json.dump(history, f, indent=2)
+
+
+def record_rates_for_symbols(
+    rates: dict[str, tuple[float, float, float]],
+) -> None:
+    """Record current rates for all symbols in history. Keeps last 6 observations."""
+    history = load_rate_history()
+    now = time.time()
+
+    for sym, (bin_apy, hl_apy, net_apy) in rates.items():
+        if sym not in history:
+            history[sym] = []
+        history[sym].append({
+            "timestamp": now,
+            "bin_apy": bin_apy,
+            "hl_apy": hl_apy,
+            "net_apy": net_apy,
+        })
+        if len(history[sym]) > 6:
+            history[sym] = history[sym][-6:]
+
+    save_rate_history(history)
+
+
+def check_rate_persistent(history: dict[str, list[dict]], symbol: str, min_apy: float) -> bool:
+    """Check if symbol has net_apy >= min_apy in at least 2 of last 3 observations."""
+    if symbol not in history or len(history[symbol]) < 3:
+        if len(history.get(symbol, [])) >= 1:
+            return history[symbol][-1].get("net_apy", 0) >= min_apy
+        return False
+    recent = history[symbol][-3:]
+    qualifying = sum(1 for obs in recent if obs.get("net_apy", 0) >= min_apy)
+    return qualifying >= MIN_ARB_APY_PERSISTENT
+
+
+def get_rate_history_for_symbol(history: dict[str, list[dict]], symbol: str) -> list[float]:
+    """Get list of net_apy values for stability calculation."""
+    if symbol not in history:
+        return []
+    return [obs.get("net_apy", 0) for obs in history[symbol]]
+
+
+def rate_stability_score(history: list[float]) -> float:
+    """
+    Calculate stability score based on coefficient of variation.
+    0.0 = wildly volatile, 1.0 = perfectly stable.
+    """
+    if len(history) < 2:
+        return 0.0
+    mean = sum(history) / len(history)
+    if mean == 0:
+        return 0.0
+    variance = sum((x - mean) ** 2 for x in history) / len(history)
+    std_dev = variance ** 0.5
+    cv = std_dev / abs(mean)
+    return max(0, 1 - cv)
+
+
+# ── Funding Timing Bonus/Penalty ───────────────────────────────────────────
+
+def get_hours_until_funding() -> int:
+    """
+    Calculate hours until next funding settlement.
+    Funding settles at 00:00, 08:00, 16:00 UTC.
+    """
+    import datetime
+    utc_now = datetime.datetime.utcnow()
+    current_hour = utc_now.hour
+    hours_until = (8 - (current_hour % 8)) % 8
+    return hours_until
+
+
+def apply_funding_timing_bonus(net_apy: float) -> float:
+    """
+    Apply bonus or penalty to net_apy based on funding timing.
+    +5% bonus if 1-4h before funding, -5% penalty if 7-8h until next.
+    """
+    hours_until = get_hours_until_funding()
+    if 1 <= hours_until <= 4:
+        return net_apy * 1.05
+    elif hours_until >= 7:
+        return net_apy * 0.95
+    else:
+        return net_apy
+
+
+# ── Cooldown System ──────────────────────────────────────────────────────────
+
+def load_cooldowns() -> dict[str, float]:
+    """Load cooldown map from file. {symbol: expiry_timestamp}"""
+    if not os.path.exists(COOLDOWN_FILE):
+        return {}
+    try:
+        with open(COOLDOWN_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_cooldowns(cooldowns: dict[str, float]) -> None:
+    """Save cooldown map to file."""
+    with open(COOLDOWN_FILE, "w") as f:
+        json.dump(cooldowns, f, indent=2)
+
+
+def is_on_cooldown(cooldowns: dict[str, float], symbol: str) -> bool:
+    """Check if symbol is currently on cooldown."""
+    if symbol not in cooldowns:
+        return False
+    expiry = cooldowns[symbol]
+    if time.time() >= expiry:
+        del cooldowns[symbol]
+        save_cooldowns(cooldowns)
+        return False
+    return True
+
+
+def add_to_cooldown(symbol: str, duration_hours: float = 16.0) -> None:
+    """Add symbol to cooldown after position closes due to reversion."""
+    cooldowns = load_cooldowns()
+    cooldowns[symbol] = time.time() + (duration_hours * 3600)
+    save_cooldowns(cooldowns)
+    logger.info("symbol_added_to_cooldown", symbol=symbol, duration_hours=duration_hours)
+
+
+def cleanup_expired_cooldowns() -> None:
+    """Remove expired cooldowns from file."""
+    cooldowns = load_cooldowns()
+    now = time.time()
+    expired = [s for s, exp in cooldowns.items() if now >= exp]
+    for s in expired:
+        del cooldowns[s]
+    if expired:
+        save_cooldowns(cooldowns)
+
+
+# ── Close Robustness Helpers (Patch C) ─────────────────────────────────────
+
+def is_circuit_breaker_active() -> bool:
+    """Check if circuit breaker is active (too many recent close failures)."""
+    global _close_failure_timestamps
+    now = time.time()
+    _close_failure_timestamps = [
+        ts for ts in _close_failure_timestamps
+        if now - ts < CIRCUIT_BREAKER_WINDOW_S
+    ]
+    return len(_close_failure_timestamps) >= CIRCUIT_BREAKER_THRESHOLD
+
+
+def record_close_failure() -> None:
+    """Record a close failure for circuit breaker tracking."""
+    global _close_failure_timestamps
+    _close_failure_timestamps.append(time.time())
+
+
+def load_alerts() -> list[dict]:
+    """Load existing alerts from file."""
+    if not os.path.exists(ALERTS_FILE):
+        return []
+    try:
+        with open(ALERTS_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_alerts(alerts: list[dict]) -> None:
+    """Save alerts to file."""
+    with open(ALERTS_FILE, "w") as f:
+        json.dump(alerts, f, indent=2)
+
+
+def add_critical_alert(pos: ArbPosition, reason: str) -> None:
+    """Add a critical alert for a persistent half-closed position."""
+    alerts = load_alerts()
+    alert = {
+        "ts": time.time(),
+        "symbol": pos.symbol,
+        "reason": reason,
+        "bin_closed": pos.bin_closed,
+        "hl_closed": pos.hl_closed,
+        "bin_close_ts": pos.bin_close_ts,
+        "hl_close_ts": pos.hl_close_ts,
+        "close_failure_count": pos.close_failure_count,
+        "notional_usdt": pos.notional_usdt,
+    }
+    alerts.append(alert)
+    alerts = alerts[-100:]
+    save_alerts(alerts)
+    console.print(f"[red]CRITICAL ALERT: {reason}[/red]")
+    console.print(f"   Symbol: {pos.symbol}, Notional: ${pos.notional_usdt:.0f}")
+    console.print(f"   Binance closed: {pos.bin_closed}, HL closed: {pos.hl_closed}")
+    console.print(f"   Failures: {pos.close_failure_count}")
+
+
+async def close_leg_with_retry(
+    close_fn,
+    symbol: str,
+    leg_name: str,
+    max_retries: int = 3,
+):
+    """Execute a close function with exponential backoff retry."""
+    for attempt in range(max_retries):
+        try:
+            result = await close_fn()
+            return result
+        except Exception as e:
+            err = str(e).lower()
+            retryable = (
+                'rate limit' in err or
+                'timeout' in err or
+                '429' in err or
+                'temporarily unavailable' in err or
+                'service unavailable' in err
+            )
+            if retryable:
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    f"{leg_name}_retry",
+                    symbol=symbol,
+                    attempt=attempt + 1,
+                    max_retries=max_retries,
+                    wait_seconds=wait,
+                    error=str(e)[:100]
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error(
+                    f"{leg_name}_unretryable",
+                    symbol=symbol,
+                    error=str(e)[:200]
+                )
+                raise
+    raise Exception(f"{leg_name} failed after {max_retries} retries")
+
+
+def check_position_health(pos: ArbPosition) -> tuple[bool, str]:
+    """Check if a position is in a problematic state."""
+    now = time.time()
+    if pos.bin_closed != pos.hl_closed:
+        half_closed_ts = pos.bin_close_ts if pos.bin_closed else pos.hl_close_ts
+        if half_closed_ts is None:
+            half_closed_ts = now
+        minutes_open = (now - half_closed_ts) / 60
+        if minutes_open > 10:
+            return False, f"Position half-closed for {minutes_open:.1f} minutes (>10min threshold)"
+        else:
+            return False, f"Position half-closed ({minutes_open:.1f}m)"
+    if pos.close_failure_count >= 5:
+        return False, f"Close failed {pos.close_failure_count} times (>=5 threshold)"
+    return True, ""
+
+
+# ── Startup Reconciliation ───────────────────────────────────────────────────
+
+async def reconcile_positions(positions: list[ArbPosition]) -> list[ArbPosition]:
+    """On startup, verify actual exchange positions vs state file."""
+    import ccxt.async_support as ccxt
+    from hl_client import make_hl_client
+
+    logger.info("reconciliation_start", positions=len(positions))
+
+    if not positions:
+        return []
+
+    key_path = os.getenv("BINANCE_PRIVATE_KEY_PATH", "")
+    secret = open(key_path).read() if key_path and os.path.exists(key_path) else os.getenv("BINANCE_API_SECRET", "")
+    bin_ex = ccxt.binanceusdm({
+        "apiKey": os.getenv("BINANCE_API_KEY", ""),
+        "secret": secret,
+        "options": {"defaultType": "future"},
+        "enableRateLimit": True,
+    })
+
+    reconciled = []
+
+    try:
+        await bin_ex.load_markets()
+        hl = make_hl_client()
+
+        for pos in positions:
+            discrepancies = []
+
+            bin_sym = pos.symbol + "/USDT:USDT"
+            bin_still_open = False
+            try:
+                positions_bin = await bin_ex.fetch_positions([bin_sym])
+                for p in positions_bin:
+                    if p.get("symbol") == bin_sym:
+                        actual_size = abs(float(p.get("contracts") or 0))
+                        if actual_size > 1e-9:
+                            bin_still_open = True
+                        if pos.bin_closed and actual_size > 1e-9:
+                            discrepancies.append(f"Binance: state=closed but exchange has {actual_size} contracts")
+                        elif not pos.bin_closed and actual_size < 1e-9:
+                            discrepancies.append(f"Binance: state=open but exchange is flat")
+            except Exception as e:
+                logger.warning("reconcile_bin_check_failed", symbol=pos.symbol, error=str(e)[:100])
+
+            hl_pos = hl.get_position(pos.symbol)
+            hl_still_open = hl_pos and abs(hl_pos.size) > 1e-9
+
+            if pos.hl_closed and hl_still_open:
+                discrepancies.append(f"HL: state=closed but exchange has {hl_pos.size} contracts")
+            elif not pos.hl_closed and not hl_still_open:
+                discrepancies.append(f"HL: state=open but exchange is flat")
+
+            if discrepancies:
+                logger.warning(
+                    "position_discrepancy",
+                    symbol=pos.symbol,
+                    discrepancies=discrepancies,
+                    state_bin_closed=pos.bin_closed,
+                    state_hl_closed=pos.hl_closed,
+                    actual_bin_open=bin_still_open,
+                    actual_hl_open=hl_still_open
+                )
+                if not bin_still_open:
+                    pos.bin_closed = True
+                    if pos.bin_close_ts is None:
+                        pos.bin_close_ts = time.time() - 3600
+                if not hl_still_open:
+                    pos.hl_closed = True
+                    if pos.hl_close_ts is None:
+                        pos.hl_close_ts = time.time() - 3600
+                if pos.bin_closed and pos.hl_closed:
+                    logger.info("reconciled_fully_closed", symbol=pos.symbol)
+                    continue
+                if pos.bin_closed != pos.hl_closed:
+                    pos.needs_close = True
+                    pos.close_failure_count = max(pos.close_failure_count, 1)
+                    logger.warning("reconciled_half_closed", symbol=pos.symbol)
+                    # Self-heal: immediately close the orphaned leg
+                    orphan_leg = "Binance" if not pos.bin_closed else "HL"
+                    console.print(f"[red]🩹 {pos.symbol} half-closed ({orphan_leg} orphaned) — auto-closing now[/red]")
+                    try:
+                        ok = await close_arb_position(pos)
+                        if ok:
+                            logger.info("reconciled_auto_closed", symbol=pos.symbol)
+                            console.print(f"[green]✓ {pos.symbol} orphaned leg closed[/green]")
+                            add_critical_alert(pos, f"Auto-closed orphaned {orphan_leg} leg on startup")
+                            continue  # don't add to reconciled — it's fully closed
+                        else:
+                            logger.error("reconciled_auto_close_failed", symbol=pos.symbol)
+                            add_critical_alert(pos, f"Failed to auto-close orphaned {orphan_leg} leg")
+                    except Exception as e:
+                        logger.error("reconciled_auto_close_error", symbol=pos.symbol, error=str(e)[:200])
+                        add_critical_alert(pos, f"Error auto-closing: {str(e)[:100]}")
+            else:
+                logger.info("reconciled_ok", symbol=pos.symbol)
+
+            reconciled.append(pos)
+
+        save_state(reconciled)
+        logger.info("reconciliation_complete", original=len(positions), final=len(reconciled))
+
+    finally:
+        await bin_ex.close()
+
+    return reconciled
+
+
 # ── Scanner ───────────────────────────────────────────────────────────────────
 
 async def scan_opportunities(
@@ -332,14 +796,25 @@ async def scan_opportunities(
     bin_volumes: dict[str, float],             # {sym: 24h_vol_usd}
     hl_volumes: dict[str, float],              # {sym: 24h_vol_usd}
     min_net_apy: float,
+    apply_filters: bool = True,
 ) -> list[ArbOpp]:
     """
     Find all cross-exchange arb opportunities above the APY threshold.
+    Applies mean-reversion filter and stability scoring when apply_filters=True.
     """
+    rate_history = load_rate_history() if apply_filters else {}
+    cooldowns = load_cooldowns() if apply_filters else {}
+
     opps = []
     for sym in set(bin_rates.keys()) & set(hl_rates.keys()):
         if sym in BLACKLIST:
             continue
+
+        # Check cooldown (don't re-enter within 16h of close)
+        if apply_filters and is_on_cooldown(cooldowns, sym):
+            logger.debug("symbol_on_cooldown", symbol=sym)
+            continue
+
         b_apy = bin_rates[sym]
         h_apy = hl_rates[sym][1]
         b_vol  = bin_volumes.get(sym, 0.0)
@@ -372,11 +847,28 @@ async def scan_opportunities(
             hl_side  = "sell" if b_apy < 0 else "buy"
 
         if net >= min_net_apy:
+            # Apply mean-reversion filter
+            if apply_filters and not check_rate_persistent(rate_history, sym, min_net_apy):
+                logger.debug("rate_not_persistent", symbol=sym, net_apy=net)
+                continue
+
+            # Apply stability score check (optional)
+            if apply_filters and MIN_STABILITY_SCORE > 0:
+                sym_history = get_rate_history_for_symbol(rate_history, sym)
+                stability = rate_stability_score(sym_history)
+                if stability < MIN_STABILITY_SCORE:
+                    logger.debug("rate_not_stable", symbol=sym, stability=stability)
+                    continue
+
+            # Apply funding timing bonus/penalty
+            adjusted_net = apply_funding_timing_bonus(net)
+
             opps.append(ArbOpp(
                 symbol=sym,
                 bin_apy=b_apy,
                 hl_apy=h_apy,
-                net_apy=net,
+                net_apy=adjusted_net,
+                raw_net_apy=net,
                 bin_side=bin_side,
                 hl_side=hl_side,
                 bin_vol=b_vol,
@@ -493,6 +985,10 @@ async def open_arb_position(
                     hl_side=opp.hl_side,  hl_size=hl_size,  hl_mid=hl_mid,
                     net_apy=round(opp.net_apy, 1))
 
+        # ── Calculate entry slippage BEFORE trading ────────────────────────
+        bin_entry_mid = bin_mid
+        hl_entry_mid = hl_mid
+
         # ── Open Binance leg first ──────────────────────────────────────────
         try:
             bin_order = await bin_ex.create_order(
@@ -501,8 +997,11 @@ async def open_arb_position(
             )
             bin_oid   = str(bin_order.get("id", ""))
             bin_fill  = float(bin_order.get("average") or bin_order.get("price") or bin_mid)
+
+            bin_entry_slippage_bps = abs(bin_fill - bin_entry_mid) / bin_entry_mid * 10000 if bin_entry_mid > 0 else 0.0
+
             logger.info("arb_bin_opened", symbol=opp.symbol, side=opp.bin_side,
-                        fill=bin_fill, oid=bin_oid)
+                        fill=bin_fill, oid=bin_oid, slippage_bps=round(bin_entry_slippage_bps, 2))
         except Exception as e:
             logger.error("arb_bin_open_failed", symbol=opp.symbol, error=str(e)[:200])
             return None
@@ -511,9 +1010,10 @@ async def open_arb_position(
         hl_is_buy = (opp.hl_side == "buy")
         hl_ok, hl_oid, hl_fill = hl.market_open(hl_sym, hl_is_buy, hl_size, slippage=SLIPPAGE)
 
+        hl_entry_slippage_bps = abs(hl_fill - hl_entry_mid) / hl_entry_mid * 10000 if hl_entry_mid > 0 else 0.0
+
         if not hl_ok:
             logger.error("arb_hl_open_failed_rolling_back_binance", symbol=opp.symbol)
-            # Rollback Binance leg
             rollback_side = "sell" if opp.bin_side == "buy" else "buy"
             try:
                 await bin_ex.create_order(
@@ -524,6 +1024,35 @@ async def open_arb_position(
             except Exception as e:
                 logger.error("arb_bin_rollback_FAILED_MANUAL_REQUIRED",
                              symbol=opp.symbol, error=str(e)[:200])
+            return None
+
+        # ── Gate: Check combined slippage ───────────────────────────────────
+        combined_slippage_bps = bin_entry_slippage_bps + hl_entry_slippage_bps
+
+        if combined_slippage_bps > SLIPPAGE_GATE_BPS:
+            logger.warning("arb_slippage_gate_triggered",
+                          symbol=opp.symbol,
+                          combined_slippage_bps=round(combined_slippage_bps, 2),
+                          threshold=SLIPPAGE_GATE_BPS,
+                          bin_slippage=round(bin_entry_slippage_bps, 2),
+                          hl_slippage=round(hl_entry_slippage_bps, 2))
+
+            rollback_bin_side = "sell" if opp.bin_side == "buy" else "buy"
+            try:
+                await bin_ex.create_order(
+                    bin_sym, "market", rollback_bin_side, bin_size,
+                    params={"reduceOnly": True}
+                )
+            except Exception:
+                pass
+
+            rollback_hl_is_buy = (opp.hl_side == "sell")
+            try:
+                hl.market_open(hl_sym, rollback_hl_is_buy, hl_size, slippage=SLIPPAGE)
+            except Exception:
+                pass
+
+            console.print(f"[red]⚠ {opp.symbol} slippage too high ({combined_slippage_bps:.2f} bps) — rejected[/red]")
             return None
 
         notional = bin_size * bin_fill
@@ -544,6 +1073,8 @@ async def open_arb_position(
             last_bin_apy  = opp.bin_apy,
             last_hl_apy   = opp.hl_apy,
             last_rate_ts  = time.time(),
+            bin_entry_slippage_bps = bin_entry_slippage_bps,
+            hl_entry_slippage_bps  = hl_entry_slippage_bps,
         )
         # Record time-series event
         record_position_open(pos)
@@ -555,10 +1086,17 @@ async def open_arb_position(
         await bin_ex.close()
 
 
-async def close_arb_position(pos: ArbPosition) -> bool:
+async def close_arb_position(
+    pos: ArbPosition,
+    exit_bin_apy: float = 0.0,
+    exit_hl_apy: float = 0.0,
+    force_slippage: bool = False,
+) -> bool:
     """
     Close both legs. Returns True if fully closed.
     Closes Binance leg first (easier to verify), then HL.
+
+    Includes: slippage tracking (Patch A), retry with backoff (Patch C).
     """
     import ccxt.async_support as ccxt
     from hl_client import make_hl_client
@@ -572,6 +1110,23 @@ async def close_arb_position(pos: ArbPosition) -> bool:
         "enableRateLimit": True,
     })
 
+    slippage = SLIPPAGE_FORCE_CLOSE if force_slippage else SLIPPAGE
+
+    # Fetch mid prices before closing for slippage calculation (Patch A)
+    bin_mid = 0.0
+    hl_mid = 0.0
+    try:
+        bin_ticker = await bin_ex.fetch_ticker(pos.symbol + "/USDT:USDT")
+        bin_mid = float(bin_ticker.get("last") or bin_ticker.get("close") or 0)
+    except Exception:
+        pass
+
+    try:
+        hl = make_hl_client()
+        hl_mid = hl.get_mid(pos.symbol)
+    except Exception:
+        pass
+
     try:
         await bin_ex.load_markets()
         bin_sym = pos.symbol + "/USDT:USDT"
@@ -579,45 +1134,110 @@ async def close_arb_position(pos: ArbPosition) -> bool:
         # ── Close Binance leg ──────────────────────────────────────────────
         if not pos.bin_closed:
             close_side = "sell" if pos.bin_side == "buy" else "buy"
-            try:
-                # Fetch actual position size first
-                positions = await bin_ex.fetch_positions([bin_sym])
+
+            async def close_bin_leg():
+                positions_list = await bin_ex.fetch_positions([bin_sym])
                 actual_size = 0.0
-                for p in positions:
+                for p in positions_list:
                     if p.get("symbol") == bin_sym:
                         actual_size = abs(float(p.get("contracts") or 0))
                 if actual_size < 1e-9:
                     logger.info("arb_bin_already_flat", symbol=pos.symbol)
+                    return {"already_closed": True}
+                order = await bin_ex.create_order(
+                    bin_sym, "market", close_side, actual_size,
+                    params={"reduceOnly": True}
+                )
+                return {"order": order}
+
+            try:
+                result = await close_leg_with_retry(
+                    close_bin_leg, pos.symbol, "bin", max_retries=3
+                )
+
+                if result.get("already_closed"):
                     pos.bin_closed = True
+                    pos.bin_exit_fill = 0.0
                 else:
-                    order = await bin_ex.create_order(
-                        bin_sym, "market", close_side, actual_size,
-                        params={"reduceOnly": True}
-                    )
+                    order = result.get("order", {})
+                    bin_fill = float(order.get("average") or order.get("price") or bin_mid or 0)
+                    pos.bin_exit_fill = bin_fill
+                    if bin_mid > 0:
+                        pos.bin_exit_slippage_bps = abs(bin_fill - bin_mid) / bin_mid * 10000
                     logger.info("arb_bin_closed", symbol=pos.symbol,
-                                fill=order.get("average") or 0)
+                                fill=bin_fill, slippage_bps=round(pos.bin_exit_slippage_bps, 2))
                     pos.bin_closed = True
+
+                pos.bin_close_ts = time.time()
+
             except Exception as e:
-                logger.error("arb_bin_close_failed", symbol=pos.symbol, error=str(e)[:200])
-                return False
+                err = str(e).lower()
+                if "position not found" in err or "position size is zero" in err:
+                    logger.info("arb_bin_already_flat", symbol=pos.symbol)
+                    pos.bin_closed = True
+                    pos.bin_close_ts = time.time()
+                else:
+                    logger.error("arb_bin_close_failed", symbol=pos.symbol, error=str(e)[:200])
+                    record_close_failure()
+                    pos.close_failure_count += 1
+                    return False
 
         # ── Close HL leg ───────────────────────────────────────────────────
         if not pos.hl_closed:
             hl = make_hl_client()
             hl_pos = hl.get_position(pos.symbol)
+
             if not hl_pos or abs(hl_pos.size) < 1e-9:
                 logger.info("arb_hl_already_flat", symbol=pos.symbol)
                 pos.hl_closed = True
+                pos.hl_close_ts = time.time()
+                pos.hl_exit_fill = 0.0
             else:
-                ok, fill = hl.market_close(pos.symbol, slippage=SLIPPAGE)
-                if ok:
-                    pos.hl_closed = True
-                    logger.info("arb_hl_closed", symbol=pos.symbol, fill=fill)
-                else:
-                    logger.error("arb_hl_close_FAILED_will_retry", symbol=pos.symbol)
-                    return False
+                def close_hl_leg():
+                    return hl.market_close(pos.symbol, slippage=slippage)
+
+                try:
+                    loop = asyncio.get_event_loop()
+                    ok, hl_fill = await loop.run_in_executor(None, close_hl_leg)
+
+                    if ok:
+                        pos.hl_exit_fill = hl_fill
+                        if hl_mid > 0:
+                            pos.hl_exit_slippage_bps = abs(hl_fill - hl_mid) / hl_mid * 10000
+                        pos.hl_closed = True
+                        pos.hl_close_ts = time.time()
+                        logger.info("arb_hl_closed", symbol=pos.symbol,
+                                    fill=hl_fill, slippage_bps=round(pos.hl_exit_slippage_bps, 2))
+                    else:
+                        raise Exception("HL market_close returned False")
+
+                except Exception as e:
+                    err = str(e).lower()
+                    if "position already closed" in err or "position not found" in err:
+                        logger.info("arb_hl_already_flat", symbol=pos.symbol)
+                        pos.hl_closed = True
+                        pos.hl_close_ts = time.time()
+                    else:
+                        logger.error("arb_hl_close_FAILED_will_retry", symbol=pos.symbol, error=str(e)[:200])
+                        record_close_failure()
+                        pos.close_failure_count += 1
+                        return False
 
         both_done = pos.bin_closed and pos.hl_closed
+
+        # Store exit APYs for P&L calculation (Patch A)
+        if both_done and exit_bin_apy != 0.0:
+            pos.exit_bin_apy = exit_bin_apy
+            pos.exit_hl_apy = exit_hl_apy
+            bin_earn_sign = 1 if pos.bin_side == "buy" else -1
+            hl_earn_sign = 1 if pos.hl_side == "buy" else -1
+            live_bin = exit_bin_apy * bin_earn_sign * (-1)
+            live_hl = exit_hl_apy * hl_earn_sign * (-1)
+            pos.exit_net_apy = live_bin + live_hl
+
+        if both_done:
+            pos.needs_close = False
+
         logger.info("arb_position_closed", symbol=pos.symbol, ok=both_done)
         return both_done
 
@@ -766,6 +1386,10 @@ async def run_cross_arb() -> None:
                 size=POSITION_SIZE_USDT, max_pos=MAX_POSITIONS)
 
     positions: list[ArbPosition] = load_state()
+
+    # --- STARTUP RECONCILIATION (Patch C) ---
+    positions = await reconcile_positions(positions)
+
     last_scan_ts = 0.0
     last_checkpoint_ts = 0.0
     hl_equity = 0.0
@@ -814,6 +1438,9 @@ async def run_cross_arb() -> None:
                         hl_rates[name] = (rate, rate * 24 * 365 * 100)
                 bin_rates, _ = await fetch_binance_data()
                 for pos in positions:
+                    # Update realized funding BEFORE updating rates (uses time since last update)
+                    if pos.symbol in bin_rates and pos.symbol in hl_rates:
+                        _update_realized_funding(pos, bin_rates[pos.symbol], hl_rates[pos.symbol][1])
                     if pos.symbol in bin_rates:
                         pos.last_bin_apy = bin_rates[pos.symbol]
                     if pos.symbol in hl_rates:
@@ -823,48 +1450,166 @@ async def run_cross_arb() -> None:
                 logger.warning("rate_refresh_failed", error=str(e)[:120])
 
         # ── 2. Exit check ─────────────────────────────────────────────────────
-        for pos in positions:
+        for pos in list(positions):
             bin_earn_sign = 1 if pos.bin_side == "buy" else -1
             hl_earn_sign  = 1 if pos.hl_side == "buy" else -1
             live_bin = pos.last_bin_apy * bin_earn_sign * (-1)
             live_hl  = pos.last_hl_apy  * hl_earn_sign  * (-1)
             live_net = live_bin + live_hl
 
-            if live_net < EXIT_ARB_APY or pos.needs_close:
+            # Fee break-even gate
+            import time as _time
+            hold_hours = (_time.time() - pos.entry_ts) / 3600
+            funding_earned = pos.funding_realized_bin + pos.funding_realized_hl
+            fee_cost = pos.notional_usdt * RT_FEE_PCT
+            fee_covered = funding_earned >= fee_cost
+            emergency_negative = live_net < -10
+            prev_funding = getattr(pos, '_prev_funding_total', None)
+            current_funding = funding_earned
+            if prev_funding is not None and current_funding < prev_funding:
+                pos._neg_funding_intervals = getattr(pos, '_neg_funding_intervals', 0) + 1
+            else:
+                pos._neg_funding_intervals = 0
+            pos._prev_funding_total = current_funding
+            sustained_bleed = getattr(pos, '_neg_funding_intervals', 0) >= 3 and live_net < EXIT_ARB_APY
+
+            should_exit = False
+            if pos.needs_close or emergency_negative:
+                should_exit = True
+            elif sustained_bleed:
+                should_exit = True
+                if not hasattr(pos, '_bleed_logged'):
+                    console.print(
+                        f"[red]{pos.symbol} sustained funding bleed ({pos._neg_funding_intervals} "
+                        f"consecutive declines, net APY {live_net:.1f}%) — closing[/red]"
+                    )
+                    pos._bleed_logged = True
+            elif live_net < EXIT_ARB_APY:
+                if fee_covered:
+                    should_exit = True
+                elif hold_hours >= MIN_HOLD_HOURS:
+                    should_exit = True
+                else:
+                    if not hasattr(pos, '_fee_gate_logged'):
+                        console.print(
+                            f"[dim]{pos.symbol} net APY {live_net:.1f}% < {EXIT_ARB_APY:.0f}% "
+                            f"but funding ${funding_earned:.4f} < fees ${fee_cost:.4f} "
+                            f"— holding (min {MIN_HOLD_HOURS}h, at {hold_hours:.1f}h)[/dim]"
+                        )
+                        pos._fee_gate_logged = True
+
+            # --- Patch C: Check position health (half-closed detection) ---
+            is_healthy, health_msg = check_position_health(pos)
+            if not is_healthy:
                 if not pos.needs_close:
+                    pos.needs_close = True
+                    logger.warning("position_unhealthy", symbol=pos.symbol, reason=health_msg)
+
+                    now_ts = time.time()
+                    half_closed = pos.bin_closed != pos.hl_closed
+                    if half_closed:
+                        half_ts = pos.bin_close_ts if pos.bin_closed else pos.hl_close_ts
+                        if half_ts and (now_ts - half_ts) > 600:
+                            add_critical_alert(pos, f"Persistent half-closed: {health_msg}")
+                            console.print(
+                                f"[yellow]Force-closing {pos.symbol} with elevated slippage[/yellow]"
+                            )
+                            ok = await close_arb_position(pos, force_slippage=True)
+                            if ok:
+                                positions.remove(pos)
+                                save_state(positions)
+                                console.print(f"[green]{pos.symbol} force-closed[/green]")
+                                continue
+                    elif pos.close_failure_count >= 5:
+                        add_critical_alert(pos, f"Excessive close failures: {pos.close_failure_count}")
+
+            if should_exit or not is_healthy:
+                if not pos.needs_close and is_healthy:
                     logger.warning("exit_signal",
                                    symbol=pos.symbol,
                                    live_net=round(live_net, 1),
-                                   threshold=EXIT_ARB_APY)
+                                   threshold=EXIT_ARB_APY,
+                                   hold_hours=round(hold_hours, 1),
+                                   funding_earned=round(funding_earned, 4),
+                                   fee_cost=round(fee_cost, 4),
+                                   fee_covered=fee_covered)
                     pos.needs_close = True
                     console.print(
-                        f"[yellow]⚠ {pos.symbol} net APY {live_net:.1f}% < {EXIT_ARB_APY:.0f}% "
-                        f"— closing[/yellow]"
+                        f"[yellow]{pos.symbol} net APY {live_net:.1f}% < {EXIT_ARB_APY:.0f}% "
+                        f"— closing (held {hold_hours:.1f}h, funding ${funding_earned:.4f} vs fees ${fee_cost:.4f})[/yellow]"
                     )
                 ok = await close_arb_position(pos)
                 if ok:
                     # Calculate exit APY and record close
                     exit_bin = pos.last_bin_apy
                     exit_hl = pos.last_hl_apy
-                    # Approximate exit net APY (using last known rates)
                     bin_earn_sign = 1 if pos.bin_side == "buy" else -1
                     hl_earn_sign = 1 if pos.hl_side == "buy" else -1
                     live_bin = exit_bin * bin_earn_sign * (-1)
                     live_hl = exit_hl * hl_earn_sign * (-1)
                     exit_net = live_bin + live_hl
-                    
-                    # Calculate realized P&L (simplified - from position data)
-                    # Using funding_realized fields which track realized funding
-                    realized_pnl = pos.funding_realized_hl + pos.funding_realized_bin
-                    
-                    record_position_close(pos, exit_net, realized_pnl)
+
+                    # === TRUE P&L CALCULATION (Patch A) ===
+                    funding_earned = pos.funding_realized_hl + pos.funding_realized_bin
+
+                    entry_slippage_cost = (
+                        (pos.bin_entry_slippage_bps / 10000) * pos.notional_usdt +
+                        (pos.hl_entry_slippage_bps / 10000) * pos.notional_usdt
+                    )
+                    exit_slippage_cost = (
+                        (pos.bin_exit_slippage_bps / 10000) * pos.notional_usdt +
+                        (pos.hl_exit_slippage_bps / 10000) * pos.notional_usdt
+                    )
+                    total_slippage_cost = entry_slippage_cost + exit_slippage_cost
+
+                    entry_basis = pos.bin_entry_px - pos.hl_entry_px
+                    exit_basis = pos.bin_exit_fill - pos.hl_exit_fill if pos.bin_exit_fill > 0 and pos.hl_exit_fill > 0 else 0.0
+                    basis_change = exit_basis - entry_basis
+                    basis_cost = basis_change * pos.notional_usdt / pos.bin_entry_px if pos.bin_entry_px > 0 else 0.0
+
+                    fee_cost_close = pos.notional_usdt * RT_FEE_PCT
+
+                    true_pnl = funding_earned - fee_cost_close - total_slippage_cost - basis_cost
+                    pos.true_pnl = true_pnl
+
+                    logger.info("true_pnl_calculation",
+                               symbol=pos.symbol,
+                               funding_earned=round(funding_earned, 4),
+                               entry_slippage=round(entry_slippage_cost, 4),
+                               exit_slippage=round(exit_slippage_cost, 4),
+                               basis_change=round(basis_change, 4),
+                               basis_cost=round(basis_cost, 4),
+                               fee_cost=round(fee_cost_close, 4),
+                               true_pnl=round(true_pnl, 4))
+
+                    record_position_close(pos, exit_net, true_pnl)
+
+                    # If closed due to APY drop, add to cooldown (Patch B)
+                    if live_net < EXIT_ARB_APY and not getattr(pos, '_manual_close', False):
+                        add_to_cooldown(pos.symbol)
+                        console.print(f"[dim]{pos.symbol} added to cooldown (16h)[/dim]")
+
                     positions.remove(pos)
                     save_state(positions)
-                    console.print(f"[green]✓ {pos.symbol} arb closed[/green]")
+                    console.print(f"[green]{pos.symbol} arb closed — true P&L: ${true_pnl:.4f}[/green]")
                     break
 
         # ── 3. Scan for new opportunities ────────────────────────────────────
-        if now - last_scan_ts >= SCAN_INTERVAL_S:
+        # Check circuit breaker before scanning (Patch C)
+        if is_circuit_breaker_active():
+            if not hasattr(run_cross_arb, '_circuit_breaker_logged'):
+                logger.warning("circuit_breaker_active",
+                               failures=len(_close_failure_timestamps),
+                               window_s=CIRCUIT_BREAKER_WINDOW_S)
+                console.print(
+                    f"[red]CIRCUIT BREAKER ACTIVE — Too many close failures "
+                    f"({len(_close_failure_timestamps)} in last {CIRCUIT_BREAKER_WINDOW_S//60}min)[/red]"
+                )
+                run_cross_arb._circuit_breaker_logged = True
+        else:
+            run_cross_arb._circuit_breaker_logged = False
+
+        if now - last_scan_ts >= SCAN_INTERVAL_S and not is_circuit_breaker_active():
             console.print(f"\n[dim]Scanning cross-exchange arb (min {MIN_ARB_APY:.0f}% APY)…[/dim]")
             try:
                 hl = make_hl_client()
@@ -878,6 +1623,27 @@ async def run_cross_arb() -> None:
                         hl_vols[name]  = float(hl_ctxs[i].get("dayNtlVlm", 0))
 
                 bin_rates, bin_vols = await fetch_binance_data()
+
+                # Record ALL rates for history tracking (Patch B)
+                all_rates = {}
+                for sym in set(bin_rates.keys()) & set(hl_rates.keys()):
+                    if sym in BLACKLIST:
+                        continue
+                    b_apy = bin_rates[sym]
+                    h_apy = hl_rates[sym][1]
+                    b_vol = bin_vols.get(sym, 0.0)
+                    h_vol = hl_vols.get(sym, 0.0)
+                    if b_vol < MIN_BIN_VOL_USD or h_vol < MIN_HL_VOL_USD:
+                        continue
+                    if b_apy < 0 and h_apy < 0:
+                        net = abs(b_apy) - abs(h_apy) if abs(b_apy) >= abs(h_apy) else abs(h_apy) - abs(b_apy)
+                    elif b_apy > 0 and h_apy > 0:
+                        net = b_apy - h_apy if b_apy >= h_apy else h_apy - b_apy
+                    else:
+                        net = abs(b_apy) + abs(h_apy)
+                    all_rates[sym] = (b_apy, h_apy, net)
+                record_rates_for_symbols(all_rates)
+
                 opps = await scan_opportunities(
                     hl_rates, bin_rates, bin_vols, hl_vols, MIN_ARB_APY
                 )
