@@ -435,6 +435,82 @@ def publish_to_redis(payload: dict) -> bool:
         return False
 
 
+def publish_to_timescale(history: list[dict], summary: dict, inventory: dict) -> bool:
+    """Sync position events and portfolio snapshot to TimescaleDB."""
+    db_url = os.getenv("TIMESCALE_DB", "")
+    if not db_url:
+        return False
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url)
+        cur = conn.cursor()
+
+        # Upsert position events (open + close)
+        for ev in history:
+            if ev.get("type") == "open":
+                cur.execute("""
+                    INSERT INTO arb_positions (symbol, opened_at, bin_side, hl_side, notional, entry_apy)
+                    VALUES (%s, to_timestamp(%s), %s, %s, %s, %s)
+                    ON CONFLICT DO NOTHING
+                """, (
+                    ev["symbol"],
+                    ev["ts"],
+                    ev.get("bin_side", ""),
+                    ev.get("hl_side", ""),
+                    ev.get("notional", 0),
+                    ev.get("entry_apy", 0),
+                ))
+            elif ev.get("type") == "close":
+                # Update existing open row with close data
+                cur.execute("""
+                    UPDATE arb_positions
+                    SET closed_at = to_timestamp(%s),
+                        exit_apy = %s,
+                        realized_total = %s,
+                        age_hours = %s
+                    WHERE symbol = %s
+                      AND closed_at IS NULL
+                      AND opened_at = (
+                          SELECT MAX(opened_at) FROM arb_positions
+                          WHERE symbol = %s AND closed_at IS NULL
+                      )
+                """, (
+                    ev["ts"],
+                    ev.get("exit_apy", 0),
+                    ev.get("realized_total", 0),
+                    ev.get("age_hours", 0),
+                    ev["symbol"],
+                    ev["symbol"],
+                ))
+
+        # Portfolio snapshot
+        inv = inventory or {}
+        bin_bal = inv.get("binance", {}).get("wallet_balance", 0)
+        hl_eq = inv.get("hl", {}).get("equity", 0)
+        cur.execute("""
+            INSERT INTO arb_portfolio_snapshots
+                (ts, position_count, total_notional, weighted_apy, daily_usd, total_realized, hl_equity, bin_balance, leverage)
+            VALUES (NOW(), %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            summary.get("position_count", 0),
+            summary.get("total_notional", 0),
+            summary.get("weighted_apy", 0),
+            summary.get("daily_usd_total", 0),
+            summary.get("realized_total", 0),
+            hl_eq,
+            bin_bal,
+            summary.get("total_notional", 0) / (bin_bal + hl_eq) if (bin_bal + hl_eq) > 0 else 0,
+        ))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        return True
+    except Exception as e:
+        print(f"[pub] Timescale sync failed: {e}", flush=True)
+        return False
+
+
 def publish_to_file(payload: dict) -> None:
     """Atomic write to fallback file (temp + os.replace)."""
     import tempfile
@@ -516,6 +592,7 @@ async def run_once() -> None:
 
     redis_ok = publish_to_redis(payload)
     publish_to_file(payload)   # always write fallback (for local dev + redundancy)
+    publish_to_timescale(history, summary, payload.get("inventory", {}))
 
     if redis_ok:
         print(f"[pub] published → Redis + file | {len(positions)} pos | "
